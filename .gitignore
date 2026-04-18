@@ -1,0 +1,47 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Python caches and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Build, packaging, and coverage
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Tooling and notebooks
+.python-version
+.ipynb_checkpoints/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and temp files
+*.log
+logs/
+tmp/
+temp/

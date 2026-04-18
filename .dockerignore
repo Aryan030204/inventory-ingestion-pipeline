@@ -1,0 +1,43 @@
+# VCS and local metadata
+.git
+.gitignore
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Local Python environments and caches
+venv/
+.venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging artifacts
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+
+# Local tooling and editor noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+tmp/
+temp/
+
+# Local compose overrides and docs noise
+docker-compose.override.yml

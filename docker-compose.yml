@@ -1,0 +1,11 @@
+services:
+  inventory-trigger-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: inventory-trigger-pipeline
+    env_file:
+      - .env
+    ports:
+      - "8050:8050"
+    restart: unless-stopped
