@@ -1,3 +1,7 @@
+networks:
+  pipeline-net:
+    external: true
+
 services:
   inventory-trigger-pipeline:
     build:
@@ -9,3 +13,5 @@ services:
     ports:
       - "8050:8050"
     restart: unless-stopped
+    networks:
+      - pipeline-net
