@@ -51,6 +51,12 @@ class InventoryItem:
 
 
 @dataclass(frozen=True)
+class BrandJob:
+    brand_id: int
+    items: List[InventoryItem]
+
+
+@dataclass(frozen=True)
 class BrandContext:
     brand_id: int
     brand_tag: str
@@ -281,42 +287,54 @@ def get_db_cursor(brand_id: int, request_id: Optional[str] = None):
         logger.info("%s Database cursor closed.", log_prefix(brand=brand, request_id=request_id))
 
 
-def parse_payload(payload: Dict[str, Any]) -> Tuple[int, List[InventoryItem]]:
+def parse_single_brand_job(payload: Dict[str, Any], job_index: Optional[int] = None) -> BrandJob:
     if not isinstance(payload, dict):
-        raise ValueError("Request body must be a JSON object.")
+        if job_index is None:
+            raise ValueError("Request body must be a JSON object.")
+        raise ValueError(f"jobs[{job_index}] must be a JSON object.")
 
     brand_id_raw = payload.get("brand_id")
     if brand_id_raw is None:
-        raise ValueError("Request body must include brand_id.")
+        if job_index is None:
+            raise ValueError("Request body must include brand_id.")
+        raise ValueError(f"jobs[{job_index}] must include brand_id.")
 
     try:
         brand_id = int(brand_id_raw)
     except (TypeError, ValueError) as exc:
-        raise ValueError("brand_id must be an integer.") from exc
+        if job_index is None:
+            raise ValueError("brand_id must be an integer.") from exc
+        raise ValueError(f"jobs[{job_index}].brand_id must be an integer.") from exc
 
     raw_items = payload.get("items")
     if not isinstance(raw_items, list) or not raw_items:
-        raise ValueError("Request body must include a non-empty items array.")
+        if job_index is None:
+            raise ValueError("Request body must include a non-empty items array.")
+        raise ValueError(f"jobs[{job_index}] must include a non-empty items array.")
 
     items: List[InventoryItem] = []
     for index, raw_item in enumerate(raw_items, start=1):
         if not isinstance(raw_item, dict):
-            raise ValueError(f"items[{index}] must be an object.")
+            prefix = "items" if job_index is None else f"jobs[{job_index}].items"
+            raise ValueError(f"{prefix}[{index}] must be an object.")
 
         try:
             product_id = int(raw_item["product_id"])
             variant_id = int(raw_item["variant_id"])
             inventory_available = int(raw_item["inventory_available"])
         except KeyError as exc:
-            raise ValueError(f"items[{index}] is missing {exc.args[0]}.") from exc
+            prefix = "items" if job_index is None else f"jobs[{job_index}].items"
+            raise ValueError(f"{prefix}[{index}] is missing {exc.args[0]}.") from exc
         except (TypeError, ValueError) as exc:
+            prefix = "items" if job_index is None else f"jobs[{job_index}].items"
             raise ValueError(
-                f"items[{index}] product_id, variant_id, and inventory_available must be integers."
+                f"{prefix}[{index}] product_id, variant_id, and inventory_available must be integers."
             ) from exc
 
         if product_id <= 0 or variant_id <= 0:
+            prefix = "items" if job_index is None else f"jobs[{job_index}].items"
             raise ValueError(
-                f"items[{index}] product_id and variant_id must be positive integers."
+                f"{prefix}[{index}] product_id and variant_id must be positive integers."
             )
 
         items.append(
@@ -327,7 +345,22 @@ def parse_payload(payload: Dict[str, Any]) -> Tuple[int, List[InventoryItem]]:
             )
         )
 
-    return brand_id, items
+    return BrandJob(brand_id=brand_id, items=items)
+
+
+def parse_payload(payload: Any) -> Tuple[List[BrandJob], bool]:
+    if isinstance(payload, dict):
+        return [parse_single_brand_job(payload)], False
+
+    if isinstance(payload, list):
+        if not payload:
+            raise ValueError("Request body array must contain at least one brand job.")
+        return [
+            parse_single_brand_job(job_payload, job_index=index)
+            for index, job_payload in enumerate(payload, start=1)
+        ], True
+
+    raise ValueError("Request body must be either a JSON object or an array of brand jobs.")
 
 
 def build_pair_filter(items: Sequence[InventoryItem]) -> Tuple[str, List[int]]:
@@ -786,28 +819,59 @@ def trigger_inventory_pipeline():
         return jsonify({"success": False, "message": "Invalid JSON body."}), 400
 
     try:
-        brand_id, items = parse_payload(payload)
+        jobs, is_batch = parse_payload(payload)
         logger.info(
-            "%s Accepted inventory trigger for brand_id=%s with %s requested items.",
+            "%s Accepted inventory trigger with %s brand job(s).",
             log_prefix(request_id=request_id),
-            brand_id,
-            len(items),
+            len(jobs),
         )
-        result = process_inventory_update(brand_id, items, request_id=request_id)
-        logger.info(
-            "%s Inventory trigger completed with %s updates.",
-            log_prefix(
-                brand=BrandContext(
-                    brand_id=result["brand_id"],
-                    brand_tag=result["brand_tag"],
-                    brand_name=result["brand_name"],
-                    database="resolved-at-runtime",
+        results: List[Dict[str, Any]] = []
+        total_items = 0
+        total_updates = 0
+
+        for job in jobs:
+            logger.info(
+                "%s Dispatching brand_id=%s with %s item(s).",
+                log_prefix(request_id=request_id),
+                job.brand_id,
+                len(job.items),
+            )
+            result = process_inventory_update(job.brand_id, job.items, request_id=request_id)
+            results.append(result)
+            total_items += len(job.items)
+            total_updates += result["updated_count"]
+            logger.info(
+                "%s Inventory trigger completed with %s updates.",
+                log_prefix(
+                    brand=BrandContext(
+                        brand_id=result["brand_id"],
+                        brand_tag=result["brand_tag"],
+                        brand_name=result["brand_name"],
+                        database="resolved-at-runtime",
+                    ),
+                    request_id=request_id,
                 ),
-                request_id=request_id,
+                result["updated_count"],
+            )
+
+        if not is_batch:
+            return jsonify({"success": True, "message": "Inventory pipeline completed.", "data": results[0]}), 200
+
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "message": "Inventory batch pipeline completed.",
+                    "data": {
+                        "brand_job_count": len(results),
+                        "received_count": total_items,
+                        "updated_count": total_updates,
+                        "results": results,
+                    },
+                }
             ),
-            result["updated_count"],
+            200,
         )
-        return jsonify({"success": True, "message": "Inventory pipeline completed.", "data": result}), 200
     except ValueError as exc:
         logger.warning(
             "%s Payload validation failed: %s",
