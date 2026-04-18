@@ -789,6 +789,65 @@ def process_inventory_update(
     return merged_result
 
 
+def process_brand_jobs_in_background(
+    jobs: Sequence[BrandJob], request_id: str
+) -> None:
+    logger.info(
+        "%s Background inventory pipeline started for %s brand job(s).",
+        log_prefix(request_id=request_id),
+        len(jobs),
+    )
+
+    total_items = 0
+    total_updates = 0
+
+    try:
+        for job in jobs:
+            logger.info(
+                "%s Dispatching brand_id=%s with %s item(s) in background.",
+                log_prefix(request_id=request_id),
+                job.brand_id,
+                len(job.items),
+            )
+            result = process_inventory_update(
+                job.brand_id, job.items, request_id=request_id
+            )
+            total_items += len(job.items)
+            total_updates += result["updated_count"]
+            logger.info(
+                "%s Inventory trigger completed with %s updates.",
+                log_prefix(
+                    brand=BrandContext(
+                        brand_id=result["brand_id"],
+                        brand_tag=result["brand_tag"],
+                        brand_name=result["brand_name"],
+                        database="resolved-at-runtime",
+                    ),
+                    request_id=request_id,
+                ),
+                result["updated_count"],
+            )
+
+        logger.info(
+            "%s Background inventory pipeline finished. brand_jobs=%s total_items=%s total_updates=%s.",
+            log_prefix(request_id=request_id),
+            len(jobs),
+            total_items,
+            total_updates,
+        )
+        logger.info(
+            "%s Inventory pipeline completed successfully for request_id=%s.",
+            log_prefix(request_id=request_id),
+            request_id,
+        )
+    except Exception as exc:
+        logger.exception(
+            "%s Background inventory pipeline failed: %s",
+            log_prefix(request_id=request_id),
+            exc,
+        )
+
+
 @app.get("/health")
 def healthcheck():
     return jsonify({"status": "ok"})
@@ -825,52 +884,29 @@ def trigger_inventory_pipeline():
             log_prefix(request_id=request_id),
             len(jobs),
         )
-        results: List[Dict[str, Any]] = []
-        total_items = 0
-        total_updates = 0
+        background_thread = threading.Thread(
+            target=process_brand_jobs_in_background,
+            args=(jobs, request_id),
+            daemon=True,
+        )
+        background_thread.start()
 
-        for job in jobs:
-            logger.info(
-                "%s Dispatching brand_id=%s with %s item(s).",
-                log_prefix(request_id=request_id),
-                job.brand_id,
-                len(job.items),
-            )
-            result = process_inventory_update(job.brand_id, job.items, request_id=request_id)
-            results.append(result)
-            total_items += len(job.items)
-            total_updates += result["updated_count"]
-            logger.info(
-                "%s Inventory trigger completed with %s updates.",
-                log_prefix(
-                    brand=BrandContext(
-                        brand_id=result["brand_id"],
-                        brand_tag=result["brand_tag"],
-                        brand_name=result["brand_name"],
-                        database="resolved-at-runtime",
-                    ),
-                    request_id=request_id,
-                ),
-                result["updated_count"],
-            )
-
-        if not is_batch:
-            return jsonify({"success": True, "message": "Inventory pipeline completed.", "data": results[0]}), 200
-
+        total_items = sum(len(job.items) for job in jobs)
         return (
             jsonify(
                 {
                     "success": True,
-                    "message": "Inventory batch pipeline completed.",
+                    "message": "Inventory pipeline accepted and started.",
                     "data": {
-                        "brand_job_count": len(results),
+                        "request_id": request_id,
+                        "brand_job_count": len(jobs),
                         "received_count": total_items,
-                        "updated_count": total_updates,
-                        "results": results,
+                        "mode": "batch" if is_batch else "single",
+                        "status": "started",
                     },
                 }
             ),
-            200,
+            202,
         )
     except ValueError as exc:
         logger.warning(
