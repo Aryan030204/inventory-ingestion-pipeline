@@ -16,4 +16,4 @@ COPY inventory_trigger_api.py .
 
 EXPOSE 8050
 
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers ${GUNICORN_WORKERS} --timeout ${GUNICORN_TIMEOUT} --graceful-timeout ${GUNICORN_GRACEFUL_TIMEOUT} inventory_trigger_api:app"]
+CMD ["python", "inventory_trigger_api.py"]

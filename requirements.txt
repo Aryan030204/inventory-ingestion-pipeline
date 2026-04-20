@@ -5,3 +5,4 @@ requests
 mysql-connector-python
 cryptography
 certifi
+redis

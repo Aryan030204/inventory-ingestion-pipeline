@@ -1,24 +1,25 @@
 import base64
+import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import certifi
 import mysql.connector
+import redis
 import requests
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
 from mysql.connector import pooling
 
 load_dotenv()
@@ -34,26 +35,24 @@ GET_BRANDS_API = os.environ.get("GET_BRANDS_API", "").strip()
 PIPELINE_AUTH_HEADER = os.environ.get("PIPELINE_AUTH_HEADER", "").strip().strip('"')
 PASSWORD_AES_KEY = os.environ.get("PASSWORD_AES_KEY", "").strip()
 DB_CONNECT_TIMEOUT_S = int(os.environ.get("DB_CONNECT_TIMEOUT_S", "10"))
-MAX_PARALLEL_WORKERS = int(os.environ.get("INVENTORY_PIPELINE_WORKERS", "4"))
-MAX_ITEMS_PER_WORKER = int(os.environ.get("INVENTORY_PIPELINE_CHUNK_SIZE", "10"))
+REDIS_URI = os.environ.get("REDIS_URI", "").strip()
+CALCULATION_INTERVAL_MINUTES = int(
+    os.environ.get("CALCULATION_INTERVAL_MINUTES", "10")
+)
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100"))
+SCHEDULED_WINDOW_MINUTES = int(os.environ.get("SCHEDULED_WINDOW", "30"))
+INGESTION_POLL_SECONDS = int(os.environ.get("INGESTION_POLL_SECONDS", "5"))
 
-app = Flask(__name__)
+SOURCE_KEY_PREFIX = os.environ.get("INVENTORY_SOURCE_PREFIX", "product_inventory")
+READY_KEY_PREFIX = os.environ.get("INVENTORY_READY_PREFIX", "inventory_calc_ready")
+READY_FLAG_KEY = os.environ.get("INVENTORY_READY_FLAG_KEY", "inventory_ingestion_ready")
+READY_COUNT_KEY = os.environ.get("INVENTORY_READY_COUNT_KEY", "inventory_calc_ready_count")
 
 _pool_lock = threading.Lock()
-_db_pools: Dict[int, pooling.MySQLConnectionPool] = {}
-
-
-@dataclass(frozen=True)
-class InventoryItem:
-    product_id: int
-    variant_id: int
-    inventory_available: int
-
-
-@dataclass(frozen=True)
-class BrandJob:
-    brand_id: int
-    items: List[InventoryItem]
+_db_pools: Dict[int, Dict[str, Any]] = {}
+_brand_cache_lock = threading.Lock()
+_brand_context_by_shop_domain: Dict[str, "BrandContext"] = {}
+_brand_cache_loaded_at = 0.0
 
 
 @dataclass(frozen=True)
@@ -62,11 +61,38 @@ class BrandContext:
     brand_tag: str
     brand_name: str
     database: str
+    shop_domain: str
 
 
-def log_prefix(
-    brand: Optional[BrandContext] = None, request_id: Optional[str] = None
-) -> str:
+@dataclass(frozen=True)
+class SourceInventoryItem:
+    shop_domain: str
+    product_id: int
+    product_title: str
+    variant_id: int
+    variant_title: str
+    sku: Optional[str]
+    inventory_quantity: int
+
+
+@dataclass(frozen=True)
+class CalculatedInventoryItem:
+    shop_domain: str
+    product_id: int
+    product_title: str
+    variant_id: int
+    variant_title: str
+    sku: Optional[str]
+    inventory_quantity: int
+    sold_units_7d: int
+    sold_units_30d: int
+    sold_units_90d: int
+    drr_7d: Decimal
+    drr_30d: Decimal
+    drr_90d: Decimal
+
+
+def log_prefix(brand: Optional[BrandContext] = None) -> str:
     if brand and brand.brand_name:
         return f"[{brand.brand_name}]"
     return "[pipeline]"
@@ -140,54 +166,110 @@ def resolve_ca_bundle_path() -> Optional[str]:
     return certifi.where()
 
 
-def fetch_brand_config(brand_id: int, request_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def fetch_active_brands() -> Dict[str, str]:
+    if not GET_BRANDS_API or not PIPELINE_AUTH_HEADER:
+        raise RuntimeError("GET_BRANDS_API or PIPELINE_AUTH_HEADER is not configured.")
+
+    headers = {"x-pipeline-key": PIPELINE_AUTH_HEADER}
+    response = requests.get(GET_BRANDS_API, headers=headers, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Brands API returned unexpected payload shape.")
+    return payload
+
+
+def fetch_brand_config(brand_id: int) -> Dict[str, Any]:
     if not GET_BRANDS_API or not PIPELINE_AUTH_HEADER:
         raise RuntimeError("GET_BRANDS_API or PIPELINE_AUTH_HEADER is not configured.")
 
     url = f"{GET_BRANDS_API.rstrip('/')}/{brand_id}"
     headers = {"x-pipeline-key": PIPELINE_AUTH_HEADER}
-    logger.info(
-        "%s Fetching brand config from tenant API: %s",
-        log_prefix(request_id=request_id),
-        url,
-    )
     response = requests.get(url, headers=headers, timeout=30)
-    if response.status_code == 200:
-        body = response.json()
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError(f"Brand config payload is invalid for brand_id={brand_id}")
+    return payload
+
+
+def normalize_shop_domain(shop_domain: str) -> str:
+    value = (shop_domain or "").strip().lower()
+    value = re.sub(r"^https?://", "", value)
+    value = value.strip("/")
+    return value
+
+
+def build_shop_domain(shop_name: str) -> str:
+    normalized = normalize_shop_domain(shop_name)
+    if normalized.endswith(".myshopify.com"):
+        return normalized
+    if normalized:
+        return f"{normalized}.myshopify.com"
+    return normalized
+
+
+def load_brand_context_cache(force: bool = False) -> Dict[str, BrandContext]:
+    global _brand_cache_loaded_at
+
+    with _brand_cache_lock:
+        if _brand_context_by_shop_domain and not force:
+            return dict(_brand_context_by_shop_domain)
+
+        brand_map = fetch_active_brands()
+        refreshed: Dict[str, BrandContext] = {}
+
+        for brand_id_raw in brand_map.keys():
+            brand_id = int(brand_id_raw)
+            config = fetch_brand_config(brand_id)
+            brand = BrandContext(
+                brand_id=brand_id,
+                brand_tag=(config.get("brand_tag") or str(brand_id)).lower(),
+                brand_name=config.get("brand_name", str(brand_id)),
+                database=config.get("db_database") or config.get("brand_tag") or str(brand_id),
+                shop_domain=build_shop_domain(config.get("shop_name", "").strip()),
+            )
+
+            refreshed[brand.shop_domain] = brand
+            shop_name = normalize_shop_domain(config.get("shop_name", ""))
+            if shop_name:
+                refreshed[shop_name] = brand
+
+        _brand_context_by_shop_domain.clear()
+        _brand_context_by_shop_domain.update(refreshed)
+        _brand_cache_loaded_at = time.time()
         logger.info(
-            "%s Brand config fetched successfully.",
-            log_prefix(
-                brand=BrandContext(
-                    brand_id=brand_id,
-                    brand_tag=(body.get("brand_tag") or str(brand_id)).lower(),
-                    brand_name=body.get("brand_name", str(brand_id)),
-                    database=body.get("db_database") or body.get("brand_tag") or str(brand_id),
-                ),
-                request_id=request_id,
-            ),
+            "%s Brand context cache loaded for %s shop domain aliases.",
+            log_prefix(),
+            len(refreshed),
         )
-        return body
-    logger.error(
-        "%s Failed to fetch brand config: %s %s",
-        log_prefix(request_id=request_id),
-        response.status_code,
-        response.text[:300],
-    )
-    return None
+        return dict(refreshed)
 
 
-def build_db_config(
-    brand_id: int, request_id: Optional[str] = None
-) -> Tuple[BrandContext, Dict[str, Any]]:
-    config = fetch_brand_config(brand_id, request_id=request_id)
-    if not config:
-        raise ValueError(f"Brand config not found for brand_id={brand_id}")
+def resolve_brand_for_shop_domain(shop_domain: str) -> BrandContext:
+    normalized = normalize_shop_domain(shop_domain)
+    cache = load_brand_context_cache()
+    brand = cache.get(normalized)
+    if brand:
+        return brand
+
+    cache = load_brand_context_cache(force=True)
+    brand = cache.get(normalized)
+    if brand:
+        return brand
+
+    raise ValueError(f"No tenant config found for shop_domain={shop_domain}")
+
+
+def build_db_config(brand_id: int) -> Tuple[BrandContext, Dict[str, Any]]:
+    config = fetch_brand_config(brand_id)
 
     return BrandContext(
         brand_id=brand_id,
         brand_tag=(config.get("brand_tag") or str(brand_id)).lower(),
         brand_name=config.get("brand_name", str(brand_id)),
         database=config.get("db_database") or config.get("brand_tag") or str(brand_id),
+        shop_domain=build_shop_domain(config.get("shop_name", "").strip()),
     ), {
         "host": config["db_host"],
         "port": int(config.get("port", 3306)),
@@ -197,19 +279,13 @@ def build_db_config(
     }
 
 
-def get_or_create_pool(
-    brand_id: int, request_id: Optional[str] = None
-) -> Tuple[BrandContext, pooling.MySQLConnectionPool]:
+def get_or_create_pool(brand_id: int) -> Tuple[BrandContext, pooling.MySQLConnectionPool]:
     with _pool_lock:
         existing = _db_pools.get(brand_id)
         if existing:
-            logger.info(
-                "%s Reusing existing MySQL connection pool.",
-                log_prefix(request_id=request_id),
-            )
             return existing["brand"], existing["pool"]
 
-        brand, db_config = build_db_config(brand_id, request_id=request_id)
+        brand, db_config = build_db_config(brand_id)
         ca_path = resolve_ca_bundle_path()
         verify_cert = os.environ.get("DB_SSL_VERIFY_CERT", "true").strip().lower() == "true"
         verify_identity = (
@@ -228,15 +304,6 @@ def get_or_create_pool(
             "pool_reset_session": True,
         }
 
-        logger.info(
-            "%s Creating MySQL connection pool host=%s port=%s ssl=%s pool_size=%s",
-            log_prefix(brand=brand, request_id=request_id),
-            db_config["host"],
-            db_config["port"],
-            "enabled" if db_config["host"].lower() not in {"localhost", "127.0.0.1"} and ca_path else "disabled",
-            connect_kwargs["pool_size"],
-        )
-
         if db_config["host"].lower() not in {"localhost", "127.0.0.1"} and ca_path:
             connect_kwargs.update(
                 {
@@ -250,11 +317,6 @@ def get_or_create_pool(
             pool = pooling.MySQLConnectionPool(**connect_kwargs)
         except Exception as exc:
             if "ssl" in str(exc).lower():
-                logger.warning(
-                    "%s SSL connection failed, retrying without SSL options: %s",
-                    log_prefix(brand=brand, request_id=request_id),
-                    exc,
-                )
                 connect_kwargs.pop("ssl_ca", None)
                 connect_kwargs.pop("ssl_verify_cert", None)
                 connect_kwargs.pop("ssl_verify_identity", None)
@@ -263,16 +325,19 @@ def get_or_create_pool(
                 raise
 
         _db_pools[brand_id] = {"brand": brand, "pool": pool}
-        logger.info("%s MySQL connection pool initialized.", log_prefix(brand=brand, request_id=request_id))
+        logger.info(
+            "%s MySQL connection pool initialized for %s.",
+            log_prefix(brand),
+            brand.shop_domain,
+        )
         return brand, pool
 
 
 @contextmanager
-def get_db_cursor(brand_id: int, request_id: Optional[str] = None):
-    brand, pool = get_or_create_pool(brand_id, request_id=request_id)
+def get_db_cursor(brand_id: int):
+    brand, pool = get_or_create_pool(brand_id)
     connection = pool.get_connection()
     cursor = connection.cursor(dictionary=True)
-    logger.info("%s Database cursor opened.", log_prefix(brand=brand, request_id=request_id))
     try:
         yield brand, cursor, connection
     finally:
@@ -284,645 +349,661 @@ def get_db_cursor(brand_id: int, request_id: Optional[str] = None):
             connection.close()
         except Exception:
             pass
-        logger.info("%s Database cursor closed.", log_prefix(brand=brand, request_id=request_id))
 
 
-def parse_single_brand_job(payload: Dict[str, Any], job_index: Optional[int] = None) -> BrandJob:
-    if not isinstance(payload, dict):
-        if job_index is None:
-            raise ValueError("Request body must be a JSON object.")
-        raise ValueError(f"jobs[{job_index}] must be a JSON object.")
-
-    brand_id_raw = payload.get("brand_id")
-    if brand_id_raw is None:
-        if job_index is None:
-            raise ValueError("Request body must include brand_id.")
-        raise ValueError(f"jobs[{job_index}] must include brand_id.")
-
-    try:
-        brand_id = int(brand_id_raw)
-    except (TypeError, ValueError) as exc:
-        if job_index is None:
-            raise ValueError("brand_id must be an integer.") from exc
-        raise ValueError(f"jobs[{job_index}].brand_id must be an integer.") from exc
-
-    raw_items = payload.get("items")
-    if not isinstance(raw_items, list) or not raw_items:
-        if job_index is None:
-            raise ValueError("Request body must include a non-empty items array.")
-        raise ValueError(f"jobs[{job_index}] must include a non-empty items array.")
-
-    items: List[InventoryItem] = []
-    for index, raw_item in enumerate(raw_items, start=1):
-        if not isinstance(raw_item, dict):
-            prefix = "items" if job_index is None else f"jobs[{job_index}].items"
-            raise ValueError(f"{prefix}[{index}] must be an object.")
-
-        try:
-            product_id = int(raw_item["product_id"])
-            variant_id = int(raw_item["variant_id"])
-            inventory_available = int(raw_item["inventory_available"])
-        except KeyError as exc:
-            prefix = "items" if job_index is None else f"jobs[{job_index}].items"
-            raise ValueError(f"{prefix}[{index}] is missing {exc.args[0]}.") from exc
-        except (TypeError, ValueError) as exc:
-            prefix = "items" if job_index is None else f"jobs[{job_index}].items"
-            raise ValueError(
-                f"{prefix}[{index}] product_id, variant_id, and inventory_available must be integers."
-            ) from exc
-
-        if product_id <= 0 or variant_id <= 0:
-            prefix = "items" if job_index is None else f"jobs[{job_index}].items"
-            raise ValueError(
-                f"{prefix}[{index}] product_id and variant_id must be positive integers."
-            )
-
-        items.append(
-            InventoryItem(
-                product_id=product_id,
-                variant_id=variant_id,
-                inventory_available=max(inventory_available, 0),
-            )
-        )
-
-    return BrandJob(brand_id=brand_id, items=items)
-
-
-def parse_payload(payload: Any) -> Tuple[List[BrandJob], bool]:
-    if isinstance(payload, dict):
-        return [parse_single_brand_job(payload)], False
-
-    if isinstance(payload, list):
-        if not payload:
-            raise ValueError("Request body array must contain at least one brand job.")
-        return [
-            parse_single_brand_job(job_payload, job_index=index)
-            for index, job_payload in enumerate(payload, start=1)
-        ], True
-
-    raise ValueError("Request body must be either a JSON object or an array of brand jobs.")
-
-
-def build_pair_filter(items: Sequence[InventoryItem]) -> Tuple[str, List[int]]:
-    clauses: List[str] = []
-    params: List[int] = []
-    for item in items:
-        clauses.append("(product_id = %s AND variant_id = %s)")
-        params.extend([item.product_id, item.variant_id])
-    return " OR ".join(clauses), params
+def get_redis_client() -> redis.Redis:
+    if not REDIS_URI:
+        raise RuntimeError("REDIS_URI is not configured.")
+    redis_uri = REDIS_URI
+    if "://" not in redis_uri:
+        redis_uri = f"redis://{redis_uri}"
+    return redis.Redis.from_url(redis_uri, decode_responses=True)
 
 
 def quantize(value: Decimal, places: str = "0.01") -> Decimal:
     return value.quantize(Decimal(places), rounding=ROUND_HALF_UP)
 
 
-def compute_metrics(sold_units: int, inventory_available: int, days: int) -> Tuple[Decimal, Decimal]:
-    sold = Decimal(sold_units)
-    inventory = Decimal(inventory_available)
-    drr = quantize(sold / Decimal(days))
+def compute_drr(sold_units: int, days: int) -> Decimal:
+    return quantize(Decimal(sold_units) / Decimal(days))
+
+
+def compute_doh(inventory_available: int, drr: Decimal) -> Decimal:
     if drr == 0:
-        return drr, Decimal("0.00")
-    doh = quantize(inventory / drr)
-    return drr, doh
+        return Decimal("0.00")
+    return quantize(Decimal(inventory_available) / drr)
 
 
-def chunk_items(items: Sequence[InventoryItem], chunk_size: int) -> List[List[InventoryItem]]:
-    return [list(items[i : i + chunk_size]) for i in range(0, len(items), chunk_size)]
+def extract_numeric_gid(value: Any, field_name: str) -> int:
+    text = str(value or "").strip()
+    match = re.search(r"(\d+)$", text)
+    if not match:
+        raise ValueError(f"{field_name} is not a valid Shopify GID or numeric id: {value}")
+    return int(match.group(1))
 
 
-def fetch_sold_units(
-    cursor,
-    items: Sequence[InventoryItem],
-    brand: BrandContext,
-    request_id: Optional[str] = None,
-) -> Dict[Tuple[int, int], Dict[str, int]]:
-    pair_filter, params = build_pair_filter(items)
-    logger.info(
-        "%s Fetching sold units from products_sold_units_daily for %s item pairs.",
-        log_prefix(brand=brand, request_id=request_id),
-        len(items),
+def parse_source_item(raw_item: Dict[str, Any], shop_domain_hint: str) -> SourceInventoryItem:
+    shop_domain = normalize_shop_domain(raw_item.get("shop_domain") or shop_domain_hint)
+    if not shop_domain:
+        raise ValueError("shop_domain is missing.")
+
+    inventory_quantity = int(raw_item.get("inventory_quantity") or 0)
+    return SourceInventoryItem(
+        shop_domain=shop_domain,
+        product_id=extract_numeric_gid(raw_item.get("product_id"), "product_id"),
+        product_title=str(raw_item.get("product_title") or "").strip(),
+        variant_id=extract_numeric_gid(raw_item.get("variant_id"), "variant_id"),
+        variant_title=str(raw_item.get("variant_title") or "").strip(),
+        sku=(str(raw_item.get("sku")).strip() if raw_item.get("sku") is not None else None),
+        inventory_quantity=max(inventory_quantity, 0),
     )
+
+
+def _decode_json_blob(raw_value: str) -> List[Dict[str, Any]]:
+    payload = json.loads(raw_value)
+    if isinstance(payload, dict):
+        return [payload]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _is_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in {"true", "1", "yes", "y"}
+
+
+def _read_source_documents(redis_client: redis.Redis, key: str) -> Tuple[str, Any]:
+    key_type = redis_client.type(key)
+    if key_type == "none":
+        return "none", None
+    if key_type == "string":
+        raw_value = redis_client.get(key)
+        return key_type, (json.loads(raw_value) if raw_value else None)
+    if key_type == "list":
+        return key_type, [json.loads(entry) for entry in redis_client.lrange(key, 0, -1)]
+    if key_type == "set":
+        return key_type, [json.loads(entry) for entry in redis_client.smembers(key)]
+    if key_type == "hash":
+        raw_map = redis_client.hgetall(key)
+        return key_type, {field: json.loads(value) for field, value in raw_map.items()}
+    logger.warning("%s Unsupported Redis key type for %s: %s", log_prefix(), key, key_type)
+    return key_type, None
+
+
+def _write_source_documents(redis_client: redis.Redis, key: str, key_type: str, payload: Any) -> None:
+    pipeline = redis_client.pipeline()
+
+    if key_type == "string":
+        if payload is None:
+            pipeline.delete(key)
+        else:
+            pipeline.set(key, json.dumps(payload, separators=(",", ":")))
+        pipeline.execute()
+        return
+
+    if key_type == "list":
+        pipeline.delete(key)
+        serialized = [json.dumps(entry, separators=(",", ":")) for entry in (payload or [])]
+        if serialized:
+            pipeline.rpush(key, *serialized)
+        pipeline.execute()
+        return
+
+    if key_type == "set":
+        pipeline.delete(key)
+        serialized = [json.dumps(entry, separators=(",", ":")) for entry in (payload or [])]
+        if serialized:
+            pipeline.sadd(key, *serialized)
+        pipeline.execute()
+        return
+
+    if key_type == "hash":
+        pipeline.delete(key)
+        if payload:
+            serialized_map = {
+                field: json.dumps(value, separators=(",", ":"))
+                for field, value in payload.items()
+            }
+            pipeline.hset(key, mapping=serialized_map)
+        pipeline.execute()
+        return
+
+
+def _collect_changed_docs_from_node(node: Any, collected: List[Dict[str, Any]]) -> Any:
+    if isinstance(node, dict):
+        if "product_id" in node and "variant_id" in node:
+            if _is_truthy(node.get("inventory_changed")):
+                updated = dict(node)
+                updated["inventory_changed"] = False
+                collected.append(updated)
+                return updated
+            return node
+
+        updated_node = {}
+        for key, value in node.items():
+            updated_node[key] = _collect_changed_docs_from_node(value, collected)
+        return updated_node
+
+    if isinstance(node, list):
+        return [_collect_changed_docs_from_node(item, collected) for item in node]
+
+    return node
+
+
+def pull_changed_source_items_for_domain(
+    redis_client: redis.Redis, shop_domain: str
+) -> List[SourceInventoryItem]:
+    key = f"{SOURCE_KEY_PREFIX}:{shop_domain}"
+    key_type, payload = _read_source_documents(redis_client, key)
+    if key_type == "none" or payload is None:
+        return []
+
+    changed_docs: List[Dict[str, Any]] = []
+    updated_payload = _collect_changed_docs_from_node(payload, changed_docs)
+    _write_source_documents(redis_client, key, key_type, updated_payload)
+
+    items: List[SourceInventoryItem] = []
+    for raw_doc in changed_docs:
+        try:
+            items.append(parse_source_item(raw_doc, shop_domain))
+        except Exception as exc:
+            logger.warning(
+                "%s Skipping invalid changed payload for %s: %s",
+                log_prefix(),
+                shop_domain,
+                exc,
+            )
+
+    return items
+
+
+def _pull_json_documents(redis_client: redis.Redis, key: str) -> List[Dict[str, Any]]:
+    key_type = redis_client.type(key)
+    docs: List[Dict[str, Any]] = []
+
+    if key_type == "none":
+        return docs
+
+    if key_type == "list":
+        raw_entries = redis_client.lrange(key, 0, -1)
+        redis_client.delete(key)
+        for raw_entry in raw_entries:
+            docs.extend(_decode_json_blob(raw_entry))
+        return docs
+
+    if key_type == "string":
+        raw_value = redis_client.get(key)
+        redis_client.delete(key)
+        if raw_value:
+            docs.extend(_decode_json_blob(raw_value))
+        return docs
+
+    if key_type == "set":
+        raw_entries = list(redis_client.smembers(key))
+        redis_client.delete(key)
+        for raw_entry in raw_entries:
+            docs.extend(_decode_json_blob(raw_entry))
+        return docs
+
+    if key_type == "hash":
+        raw_entries = list(redis_client.hvals(key))
+        redis_client.delete(key)
+        for raw_entry in raw_entries:
+            docs.extend(_decode_json_blob(raw_entry))
+        return docs
+
+    logger.warning("%s Unsupported Redis key type for %s: %s", log_prefix(), key, key_type)
+    return docs
+
+
+def serialize_ready_item(item: CalculatedInventoryItem) -> str:
+    return json.dumps(
+        {
+            "shop_domain": item.shop_domain,
+            "product_id": item.product_id,
+            "product_title": item.product_title,
+            "variant_id": item.variant_id,
+            "variant_title": item.variant_title,
+            "sku": item.sku,
+            "inventory_quantity": item.inventory_quantity,
+            "sold_units_7d": item.sold_units_7d,
+            "sold_units_30d": item.sold_units_30d,
+            "sold_units_90d": item.sold_units_90d,
+            "drr_7d": str(item.drr_7d),
+            "drr_30d": str(item.drr_30d),
+            "drr_90d": str(item.drr_90d),
+        },
+        separators=(",", ":"),
+    )
+
+
+def parse_ready_item(raw_doc: Dict[str, Any], shop_domain_hint: str) -> CalculatedInventoryItem:
+    shop_domain = normalize_shop_domain(raw_doc.get("shop_domain") or shop_domain_hint)
+    return CalculatedInventoryItem(
+        shop_domain=shop_domain,
+        product_id=int(raw_doc["product_id"]),
+        product_title=str(raw_doc.get("product_title") or "").strip(),
+        variant_id=int(raw_doc["variant_id"]),
+        variant_title=str(raw_doc.get("variant_title") or "").strip(),
+        sku=(str(raw_doc.get("sku")).strip() if raw_doc.get("sku") is not None else None),
+        inventory_quantity=max(int(raw_doc.get("inventory_quantity") or 0), 0),
+        sold_units_7d=max(int(raw_doc.get("sold_units_7d") or 0), 0),
+        sold_units_30d=max(int(raw_doc.get("sold_units_30d") or 0), 0),
+        sold_units_90d=max(int(raw_doc.get("sold_units_90d") or 0), 0),
+        drr_7d=Decimal(str(raw_doc.get("drr_7d") or "0")),
+        drr_30d=Decimal(str(raw_doc.get("drr_30d") or "0")),
+        drr_90d=Decimal(str(raw_doc.get("drr_90d") or "0")),
+    )
+
+
+def pull_ready_items_for_domain(
+    redis_client: redis.Redis, shop_domain: str
+) -> List[CalculatedInventoryItem]:
+    key = f"{READY_KEY_PREFIX}:{shop_domain}"
+    raw_docs = _pull_json_documents(redis_client, key)
+    items: List[CalculatedInventoryItem] = []
+    for raw_doc in raw_docs:
+        try:
+            items.append(parse_ready_item(raw_doc, shop_domain))
+        except Exception as exc:
+            logger.warning(
+                "%s Skipping invalid ready payload for %s: %s",
+                log_prefix(),
+                shop_domain,
+                exc,
+            )
+    return items
+
+
+def store_ready_items(
+    redis_client: redis.Redis, shop_domain: str, items: Sequence[CalculatedInventoryItem]
+) -> None:
+    if not items:
+        return
+
+    key = f"{READY_KEY_PREFIX}:{shop_domain}"
+    payloads = [serialize_ready_item(item) for item in items]
+    pipeline = redis_client.pipeline()
+    pipeline.rpush(key, *payloads)
+    pipeline.incrby(READY_COUNT_KEY, len(payloads))
+    pipeline.execute()
+    logger.info(
+        "%s Cached %s calculated records to %s.",
+        log_prefix(),
+        len(payloads),
+        key,
+    )
+
+
+def scan_shop_domains(redis_client: redis.Redis, prefix: str) -> List[str]:
+    domains: List[str] = []
+    pattern = f"{prefix}:*"
+    for key in redis_client.scan_iter(match=pattern):
+        if ":" not in key:
+            continue
+        domains.append(key.split(":", 1)[1])
+    return sorted(set(domains))
+
+
+def should_trigger_ingestion(redis_client: redis.Redis) -> bool:
+    ready_count = int(redis_client.get(READY_COUNT_KEY) or 0)
+    if ready_count >= BATCH_SIZE:
+        redis_client.set(READY_FLAG_KEY, "1")
+        logger.info(
+            "%s Ready count %s reached batch size %s. Ingestion flagged.",
+            log_prefix(),
+            ready_count,
+            BATCH_SIZE,
+        )
+        return True
+    return False
+
+
+def bulk_fetch_sold_units(cursor, product_ids: Sequence[int]) -> Dict[int, Dict[str, int]]:
+    if not product_ids:
+        return {}
+
+    placeholders = ", ".join(["%s"] * len(product_ids))
+    end_dt = datetime.utcnow()
+    start_7d = end_dt - timedelta(days=7)
+    start_30d = end_dt - timedelta(days=30)
+    start_90d = end_dt - timedelta(days=90)
+
     cursor.execute(
         f"""
-        SELECT product_id, variant_id, sold_units_7d, sold_units_30d, sold_units_90d
-        FROM products_sold_units_daily
-        WHERE {pair_filter}
+        SELECT
+            product_id,
+            SUM(CASE WHEN created_dt >= %s AND created_dt <= %s THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_7d,
+            SUM(CASE WHEN created_dt >= %s AND created_dt <= %s THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_30d,
+            SUM(CASE WHEN created_dt >= %s AND created_dt <= %s THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_90d
+        FROM shopify_orders
+        WHERE created_dt >= %s
+          AND created_dt <= %s
+          AND product_id IN ({placeholders})
+        GROUP BY product_id
         """,
-        params,
+        (
+            start_7d,
+            end_dt,
+            start_30d,
+            end_dt,
+            start_90d,
+            end_dt,
+            start_90d,
+            end_dt,
+            *product_ids,
+        ),
     )
 
-    result: Dict[Tuple[int, int], Dict[str, int]] = {}
+    sold_units_by_product: Dict[int, Dict[str, int]] = {}
     for row in cursor.fetchall():
-        result[(int(row["product_id"]), int(row["variant_id"]))] = {
+        sold_units_by_product[int(row["product_id"])] = {
             "sold_units_7d": int(row.get("sold_units_7d") or 0),
             "sold_units_30d": int(row.get("sold_units_30d") or 0),
             "sold_units_90d": int(row.get("sold_units_90d") or 0),
         }
+
+    return sold_units_by_product
+
+
+def calculate_domain_items(
+    brand: BrandContext, source_items: Sequence[SourceInventoryItem]
+) -> List[CalculatedInventoryItem]:
+    product_ids = sorted({item.product_id for item in source_items})
+    with get_db_cursor(brand.brand_id) as (_, cursor, _connection):
+        sold_units_by_product = bulk_fetch_sold_units(cursor, product_ids)
+
+    calculated_items: List[CalculatedInventoryItem] = []
+    for item in source_items:
+        sold_units = sold_units_by_product.get(
+            item.product_id,
+            {"sold_units_7d": 0, "sold_units_30d": 0, "sold_units_90d": 0},
+        )
+        calculated_items.append(
+            CalculatedInventoryItem(
+                shop_domain=item.shop_domain,
+                product_id=item.product_id,
+                product_title=item.product_title or f"Product {item.product_id}",
+                variant_id=item.variant_id,
+                variant_title=item.variant_title or f"Variant {item.variant_id}",
+                sku=item.sku,
+                inventory_quantity=item.inventory_quantity,
+                sold_units_7d=sold_units["sold_units_7d"],
+                sold_units_30d=sold_units["sold_units_30d"],
+                sold_units_90d=sold_units["sold_units_90d"],
+                drr_7d=compute_drr(sold_units["sold_units_7d"], 7),
+                drr_30d=compute_drr(sold_units["sold_units_30d"], 30),
+                drr_90d=compute_drr(sold_units["sold_units_90d"], 90),
+            )
+        )
+
     logger.info(
-        "%s Sold units fetched for %s/%s requested pairs.",
-        log_prefix(brand=brand, request_id=request_id),
-        len(result),
-        len(items),
+        "%s Calculation worker produced %s records for %s.",
+        log_prefix(brand),
+        len(calculated_items),
+        brand.shop_domain,
     )
-    return result
+    return calculated_items
 
 
-def fetch_existing_inventory_rows(
-    cursor, items: Sequence[InventoryItem], brand: BrandContext, request_id: Optional[str] = None
-) -> Dict[Tuple[int, int], Dict[str, Optional[str]]]:
-    pair_filter, params = build_pair_filter(items)
+def upsert_top_products_inventory(
+    brand: BrandContext, items: Sequence[CalculatedInventoryItem]
+) -> int:
+    if not items:
+        return 0
+
+    upsert_rows = []
+    for item in items:
+        doh_7d = compute_doh(item.inventory_quantity, item.drr_7d)
+        doh_30d = compute_doh(item.inventory_quantity, item.drr_30d)
+        doh_90d = compute_doh(item.inventory_quantity, item.drr_90d)
+        upsert_rows.append(
+            (
+                item.product_id,
+                item.product_title,
+                item.variant_id,
+                item.variant_title,
+                item.sku,
+                item.inventory_quantity,
+                item.sold_units_7d,
+                item.sold_units_30d,
+                item.sold_units_90d,
+                str(item.drr_7d),
+                str(item.drr_30d),
+                str(item.drr_90d),
+                str(doh_7d),
+                str(doh_30d),
+                str(doh_90d),
+            )
+        )
+
+    with get_db_cursor(brand.brand_id) as (_, cursor, connection):
+        cursor.executemany(
+            """
+            INSERT INTO top_products_inventory (
+                product_id,
+                product_title,
+                variant_id,
+                variant_title,
+                sku,
+                inventory_available,
+                sold_units_7d,
+                sold_units_30d,
+                sold_units_90d,
+                drr_7d,
+                drr_30d,
+                drr_90d,
+                doh_7d,
+                doh_30d,
+                doh_90d
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                product_title = COALESCE(NULLIF(VALUES(product_title), ''), product_title),
+                variant_title = COALESCE(NULLIF(VALUES(variant_title), ''), variant_title),
+                sku = COALESCE(VALUES(sku), sku),
+                inventory_available = VALUES(inventory_available),
+                sold_units_7d = VALUES(sold_units_7d),
+                sold_units_30d = VALUES(sold_units_30d),
+                sold_units_90d = VALUES(sold_units_90d),
+                drr_7d = VALUES(drr_7d),
+                drr_30d = VALUES(drr_30d),
+                drr_90d = VALUES(drr_90d),
+                doh_7d = VALUES(doh_7d),
+                doh_30d = VALUES(doh_30d),
+                doh_90d = VALUES(doh_90d),
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            upsert_rows,
+        )
+        connection.commit()
+
     logger.info(
-        "%s Fetching existing rows from top_products_inventory.",
-        log_prefix(brand=brand, request_id=request_id),
+        "%s Ingestion worker upserted %s rows into top_products_inventory.",
+        log_prefix(brand),
+        len(upsert_rows),
     )
-    cursor.execute(
-        f"""
-        SELECT product_id, variant_id, product_title, variant_title, sku
-        FROM top_products_inventory
-        WHERE {pair_filter}
-        """,
-        params,
-    )
-    rows = {
-        (int(row["product_id"]), int(row["variant_id"])): {
-            "product_title": row.get("product_title"),
-            "variant_title": row.get("variant_title"),
-            "sku": row.get("sku"),
-        }
-        for row in cursor.fetchall()
-    }
-    logger.info(
-        "%s Existing inventory rows found for %s/%s pairs.",
-        log_prefix(brand=brand, request_id=request_id),
-        len(rows),
-        len(items),
-    )
-    return rows
+    return len(upsert_rows)
 
 
-def fetch_latest_order_metadata(
-    cursor, items: Sequence[InventoryItem], brand: BrandContext, request_id: Optional[str] = None
-) -> Dict[Tuple[int, int], Dict[str, Optional[str]]]:
-    pair_filter, params = build_pair_filter(items)
-    metadata_by_pair: Dict[Tuple[int, int], Dict[str, Optional[str]]] = {}
-    logger.info(
-        "%s Fetching latest product metadata from order tables.",
-        log_prefix(brand=brand, request_id=request_id),
-    )
+def run_calculation_cycle(redis_client: redis.Redis) -> Dict[str, int]:
+    domains = scan_shop_domains(redis_client, SOURCE_KEY_PREFIX)
+    if not domains:
+        logger.info("%s Calculation worker found no source inventory keys.", log_prefix())
+        return {"domains": 0, "source_items": 0, "ready_items": 0}
 
-    cursor.execute(
-        f"""
-        SELECT product_id, variant_id, line_item, variant_title, sku, updated_at, created_at
-        FROM (
-            SELECT product_id, variant_id, line_item, variant_title, sku, updated_at, created_at
-            FROM shopify_orders_update
-            WHERE {pair_filter}
+    processed_domains = 0
+    source_count = 0
+    ready_count = 0
 
-            UNION ALL
-
-            SELECT product_id, variant_id, line_item, variant_title, sku, updated_at, created_at
-            FROM shopify_orders
-            WHERE {pair_filter}
-        ) AS combined_orders
-        ORDER BY COALESCE(updated_at, created_at) DESC
-        """,
-        params + params,
-    )
-
-    for row in cursor.fetchall():
-        try:
-            pair = (int(row["product_id"]), int(row["variant_id"]))
-        except (TypeError, ValueError):
+    for domain in domains:
+        source_items = pull_changed_source_items_for_domain(redis_client, domain)
+        if not source_items:
             continue
 
-        if pair in metadata_by_pair:
-            continue
+        brand = resolve_brand_for_shop_domain(domain)
+        calculated_items = calculate_domain_items(brand, source_items)
+        store_ready_items(redis_client, brand.shop_domain, calculated_items)
+        should_trigger_ingestion(redis_client)
 
-        metadata_by_pair[pair] = {
-            "product_title": row.get("line_item"),
-            "variant_title": row.get("variant_title"),
-            "sku": row.get("sku"),
-        }
+        processed_domains += 1
+        source_count += len(source_items)
+        ready_count += len(calculated_items)
 
     logger.info(
-        "%s Order metadata found for %s/%s pairs.",
-        log_prefix(brand=brand, request_id=request_id),
-        len(metadata_by_pair),
-        len(items),
+        "%s Calculation cycle complete. domains=%s source_items=%s ready_items=%s",
+        log_prefix(),
+        processed_domains,
+        source_count,
+        ready_count,
     )
-    return metadata_by_pair
-
-
-def process_inventory_chunk(
-    brand_id: int,
-    items: Sequence[InventoryItem],
-    request_id: Optional[str] = None,
-    worker_id: Optional[int] = None,
-    chunk_index: Optional[int] = None,
-    total_chunks: Optional[int] = None,
-) -> Dict[str, Any]:
-    request_pairs = {(item.product_id, item.variant_id) for item in items}
-    start_ts = time.perf_counter()
-
-    with get_db_cursor(brand_id, request_id=request_id) as (brand, cursor, connection):
-        logger.info(
-            "%s Worker=%s chunk=%s/%s starting inventory upsert for %s incoming items.",
-            log_prefix(brand=brand, request_id=request_id),
-            worker_id if worker_id is not None else "-",
-            chunk_index if chunk_index is not None else "-",
-            total_chunks if total_chunks is not None else "-",
-            len(items),
-        )
-        sold_units_map = fetch_sold_units(cursor, items, brand, request_id=request_id)
-        existing_inventory_map = fetch_existing_inventory_rows(
-            cursor, items, brand, request_id=request_id
-        )
-        order_metadata_map = fetch_latest_order_metadata(
-            cursor, items, brand, request_id=request_id
-        )
-
-        missing_in_sales = sorted(request_pairs - set(sold_units_map.keys()))
-        missing_in_inventory = sorted(request_pairs - set(existing_inventory_map.keys()))
-        missing_metadata: List[Tuple[int, int]] = []
-
-        upsert_rows = []
-        updated_pairs: List[Tuple[int, int]] = []
-
-        for item in items:
-            pair = (item.product_id, item.variant_id)
-            sold_units = sold_units_map.get(pair)
-            if not sold_units:
-                continue
-
-            drr_7d, doh_7d = compute_metrics(
-                sold_units["sold_units_7d"], item.inventory_available, 7
-            )
-            drr_30d, doh_30d = compute_metrics(
-                sold_units["sold_units_30d"], item.inventory_available, 30
-            )
-            drr_90d, doh_90d = compute_metrics(
-                sold_units["sold_units_90d"], item.inventory_available, 90
-            )
-
-            metadata = existing_inventory_map.get(pair) or order_metadata_map.get(pair) or {}
-            product_title = (metadata.get("product_title") or "").strip() or f"Product {item.product_id}"
-            variant_title = (metadata.get("variant_title") or "").strip() or f"Variant {item.variant_id}"
-            sku = metadata.get("sku")
-
-            if pair not in existing_inventory_map and pair not in order_metadata_map:
-                missing_metadata.append(pair)
-
-            upsert_rows.append(
-                (
-                    item.product_id,
-                    product_title,
-                    item.variant_id,
-                    variant_title,
-                    sku,
-                    item.inventory_available,
-                    sold_units["sold_units_7d"],
-                    sold_units["sold_units_30d"],
-                    sold_units["sold_units_90d"],
-                    str(drr_7d),
-                    str(drr_30d),
-                    str(drr_90d),
-                    str(doh_7d),
-                    str(doh_30d),
-                    str(doh_90d),
-                )
-            )
-            updated_pairs.append(pair)
-
-        logger.info(
-            "%s Worker=%s chunk=%s/%s prepared upsert batch. ready=%s missing_sales=%s missing_inventory=%s metadata_fallback=%s",
-            log_prefix(brand=brand, request_id=request_id),
-            worker_id if worker_id is not None else "-",
-            chunk_index if chunk_index is not None else "-",
-            total_chunks if total_chunks is not None else "-",
-            len(upsert_rows),
-            len(missing_in_sales),
-            len(missing_in_inventory),
-            len(set(missing_metadata)),
-        )
-
-        if upsert_rows:
-            cursor.executemany(
-                """
-                INSERT INTO top_products_inventory (
-                    product_id,
-                    product_title,
-                    variant_id,
-                    variant_title,
-                    sku,
-                    inventory_available,
-                    sold_units_7d,
-                    sold_units_30d,
-                    sold_units_90d,
-                    drr_7d,
-                    drr_30d,
-                    drr_90d,
-                    doh_7d,
-                    doh_30d,
-                    doh_90d
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    product_id = VALUES(product_id),
-                    product_title = COALESCE(NULLIF(VALUES(product_title), ''), product_title),
-                    variant_title = COALESCE(NULLIF(VALUES(variant_title), ''), variant_title),
-                    sku = COALESCE(VALUES(sku), sku),
-                    inventory_available = VALUES(inventory_available),
-                    sold_units_7d = VALUES(sold_units_7d),
-                    sold_units_30d = VALUES(sold_units_30d),
-                    sold_units_90d = VALUES(sold_units_90d),
-                    drr_7d = VALUES(drr_7d),
-                    drr_30d = VALUES(drr_30d),
-                    drr_90d = VALUES(drr_90d),
-                    doh_7d = VALUES(doh_7d),
-                    doh_30d = VALUES(doh_30d),
-                    doh_90d = VALUES(doh_90d),
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                upsert_rows,
-            )
-            connection.commit()
-            logger.info(
-                "%s Worker=%s chunk=%s/%s upsert committed successfully for %s rows.",
-                log_prefix(brand=brand, request_id=request_id),
-                worker_id if worker_id is not None else "-",
-                chunk_index if chunk_index is not None else "-",
-                total_chunks if total_chunks is not None else "-",
-                len(upsert_rows),
-            )
-        else:
-            logger.info(
-                "%s Worker=%s chunk=%s/%s no rows qualified for upsert after sold-units filtering.",
-                log_prefix(brand=brand, request_id=request_id),
-                worker_id if worker_id is not None else "-",
-                chunk_index if chunk_index is not None else "-",
-                total_chunks if total_chunks is not None else "-",
-            )
-
-    elapsed_s = round(time.perf_counter() - start_ts, 2)
-    logger.info(
-        "%s Worker=%s chunk=%s/%s finished in %ss.",
-        log_prefix(brand=brand, request_id=request_id),
-        worker_id if worker_id is not None else "-",
-        chunk_index if chunk_index is not None else "-",
-        total_chunks if total_chunks is not None else "-",
-        elapsed_s,
-    )
-
     return {
-        "brand_id": brand_id,
-        "brand_tag": brand.brand_tag,
-        "brand_name": brand.brand_name,
-        "received_count": len(items),
-        "updated_count": len(upsert_rows),
-        "duration_seconds": elapsed_s,
-        "missing_in_products_sold_units_daily": [
-            {"product_id": product_id, "variant_id": variant_id}
-            for product_id, variant_id in missing_in_sales
-        ],
-        "missing_in_top_products_inventory": [
-            {"product_id": product_id, "variant_id": variant_id}
-            for product_id, variant_id in missing_in_inventory
-        ],
-        "missing_metadata_fallback_used": [
-            {"product_id": product_id, "variant_id": variant_id}
-            for product_id, variant_id in sorted(set(missing_metadata))
-        ],
-        "updated_pairs": [
-            {"product_id": product_id, "variant_id": variant_id}
-            for product_id, variant_id in updated_pairs
-        ],
+        "domains": processed_domains,
+        "source_items": source_count,
+        "ready_items": ready_count,
     }
 
 
-def process_inventory_update(
-    brand_id: int, items: Sequence[InventoryItem], request_id: Optional[str] = None
-) -> Dict[str, Any]:
-    start_ts = time.perf_counter()
-    brand, _ = get_or_create_pool(brand_id, request_id=request_id)
-    chunks = chunk_items(items, MAX_ITEMS_PER_WORKER)
-    worker_count = min(MAX_PARALLEL_WORKERS, max(1, len(chunks)))
+def run_ingestion_cycle(redis_client: redis.Redis, reason: str) -> Dict[str, int]:
+    domains = scan_shop_domains(redis_client, READY_KEY_PREFIX)
+    if not domains:
+        redis_client.delete(READY_FLAG_KEY)
+        redis_client.set(READY_COUNT_KEY, "0")
+        logger.info("%s Ingestion worker found no ready keys (%s).", log_prefix(), reason)
+        return {"domains": 0, "ready_items": 0, "upserted_items": 0}
+
+    processed_domains = 0
+    pulled_count = 0
+    upserted_count = 0
+
+    for domain in domains:
+        ready_items = pull_ready_items_for_domain(redis_client, domain)
+        if not ready_items:
+            continue
+
+        brand = resolve_brand_for_shop_domain(domain)
+        upserted_count += upsert_top_products_inventory(brand, ready_items)
+        processed_domains += 1
+        pulled_count += len(ready_items)
+
+    remaining_domains = scan_shop_domains(redis_client, READY_KEY_PREFIX)
+    if remaining_domains:
+        remaining_total = 0
+        for domain in remaining_domains:
+            remaining_total += redis_client.llen(f"{READY_KEY_PREFIX}:{domain}")
+        redis_client.set(READY_COUNT_KEY, remaining_total)
+        if remaining_total >= BATCH_SIZE:
+            redis_client.set(READY_FLAG_KEY, "1")
+        else:
+            redis_client.delete(READY_FLAG_KEY)
+    else:
+        redis_client.delete(READY_FLAG_KEY)
+        redis_client.set(READY_COUNT_KEY, "0")
 
     logger.info(
-        "%s Starting parallel inventory pipeline workers=%s chunks=%s chunk_size=%s total_items=%s.",
-        log_prefix(brand=brand, request_id=request_id),
-        worker_count,
-        len(chunks),
-        MAX_ITEMS_PER_WORKER,
-        len(items),
+        "%s Ingestion cycle complete (%s). domains=%s pulled=%s upserted=%s",
+        log_prefix(),
+        reason,
+        processed_domains,
+        pulled_count,
+        upserted_count,
     )
-
-    results: List[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_to_chunk = {
-            executor.submit(
-                process_inventory_chunk,
-                brand_id,
-                chunk,
-                request_id,
-                ((index - 1) % worker_count) + 1,
-                index,
-                len(chunks),
-            ): index
-            for index, chunk in enumerate(chunks, start=1)
-        }
-
-        for future in as_completed(future_to_chunk):
-            chunk_index = future_to_chunk[future]
-            chunk_result = future.result()
-            results.append(chunk_result)
-            logger.info(
-                "%s Chunk %s/%s completed with %s updates.",
-                log_prefix(brand=brand, request_id=request_id),
-                chunk_index,
-                len(chunks),
-                chunk_result["updated_count"],
-            )
-
-    elapsed_s = round(time.perf_counter() - start_ts, 2)
-
-    merged_result = {
-        "brand_id": brand.brand_id,
-        "brand_tag": brand.brand_tag,
-        "brand_name": brand.brand_name,
-        "received_count": len(items),
-        "updated_count": sum(result["updated_count"] for result in results),
-        "duration_seconds": elapsed_s,
-        "worker_count": worker_count,
-        "chunk_count": len(chunks),
-        "chunk_size": MAX_ITEMS_PER_WORKER,
-        "missing_in_products_sold_units_daily": [],
-        "missing_in_top_products_inventory": [],
-        "missing_metadata_fallback_used": [],
-        "updated_pairs": [],
+    return {
+        "domains": processed_domains,
+        "ready_items": pulled_count,
+        "upserted_items": upserted_count,
     }
 
-    seen_keys = {
-        "missing_in_products_sold_units_daily": set(),
-        "missing_in_top_products_inventory": set(),
-        "missing_metadata_fallback_used": set(),
-        "updated_pairs": set(),
-    }
 
-    for result in results:
-        for key in seen_keys:
-            for row in result[key]:
-                pair = (row["product_id"], row["variant_id"])
-                if pair in seen_keys[key]:
-                    continue
-                seen_keys[key].add(pair)
-                merged_result[key].append(row)
-
+def calculation_worker(stop_event: threading.Event) -> None:
+    redis_client = get_redis_client()
     logger.info(
-        "%s Parallel inventory pipeline finished in %ss. total_updates=%s total_chunks=%s workers=%s.",
-        log_prefix(brand=brand, request_id=request_id),
-        elapsed_s,
-        merged_result["updated_count"],
-        merged_result["chunk_count"],
-        merged_result["worker_count"],
+        "%s calculationWorker started. interval=%s minutes",
+        log_prefix(),
+        CALCULATION_INTERVAL_MINUTES,
     )
 
-    return merged_result
+    while not stop_event.is_set():
+        cycle_started_at = time.time()
+        try:
+            run_calculation_cycle(redis_client)
+        except Exception as exc:
+            logger.exception("%s calculationWorker failed: %s", log_prefix(), exc)
+
+        elapsed = time.time() - cycle_started_at
+        sleep_for = max(1, CALCULATION_INTERVAL_MINUTES * 60 - int(elapsed))
+        stop_event.wait(sleep_for)
 
 
-def process_brand_jobs_in_background(
-    jobs: Sequence[BrandJob], request_id: str
-) -> None:
+def ingestion_worker(stop_event: threading.Event) -> None:
+    redis_client = get_redis_client()
+    next_scheduled_run_at = time.time() + max(1, SCHEDULED_WINDOW_MINUTES * 60)
     logger.info(
-        "%s Background inventory pipeline started for %s brand job(s).",
-        log_prefix(request_id=request_id),
-        len(jobs),
+        "%s ingestionWorker started. scheduled_window=%s minutes batch_size=%s",
+        log_prefix(),
+        SCHEDULED_WINDOW_MINUTES,
+        BATCH_SIZE,
     )
 
-    total_items = 0
-    total_updates = 0
+    while not stop_event.is_set():
+        try:
+            flagged = str(redis_client.get(READY_FLAG_KEY) or "").strip() == "1"
+            now_ts = time.time()
+            scheduled_due = now_ts >= next_scheduled_run_at
+
+            if flagged:
+                run_ingestion_cycle(redis_client, reason="batch-threshold")
+                next_scheduled_run_at = time.time() + max(1, SCHEDULED_WINDOW_MINUTES * 60)
+            elif scheduled_due:
+                run_ingestion_cycle(redis_client, reason="scheduled-window")
+                next_scheduled_run_at = time.time() + max(1, SCHEDULED_WINDOW_MINUTES * 60)
+        except Exception as exc:
+            logger.exception("%s ingestionWorker failed: %s", log_prefix(), exc)
+
+        stop_event.wait(max(1, INGESTION_POLL_SECONDS))
+
+
+def validate_environment() -> None:
+    missing = []
+    if not REDIS_URI:
+        missing.append("REDIS_URI")
+    if not GET_BRANDS_API:
+        missing.append("GET_BRANDS_API")
+    if not PIPELINE_AUTH_HEADER:
+        missing.append("PIPELINE_AUTH_HEADER")
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+
+def main() -> None:
+    validate_environment()
+    load_brand_context_cache(force=True)
+
+    stop_event = threading.Event()
+    workers = [
+        threading.Thread(target=calculation_worker, args=(stop_event,), daemon=True),
+        threading.Thread(target=ingestion_worker, args=(stop_event,), daemon=True),
+    ]
+
+    for worker in workers:
+        worker.start()
+
+    logger.info("%s Inventory Redis worker service started.", log_prefix())
 
     try:
-        for job in jobs:
-            logger.info(
-                "%s Dispatching brand_id=%s with %s item(s) in background.",
-                log_prefix(request_id=request_id),
-                job.brand_id,
-                len(job.items),
-            )
-            result = process_inventory_update(
-                job.brand_id, job.items, request_id=request_id
-            )
-            total_items += len(job.items)
-            total_updates += result["updated_count"]
-            logger.info(
-                "%s Inventory trigger completed with %s updates.",
-                log_prefix(
-                    brand=BrandContext(
-                        brand_id=result["brand_id"],
-                        brand_tag=result["brand_tag"],
-                        brand_name=result["brand_name"],
-                        database="resolved-at-runtime",
-                    ),
-                    request_id=request_id,
-                ),
-                result["updated_count"],
-            )
-
-        logger.info(
-            "%s Background inventory pipeline finished. brand_jobs=%s total_items=%s total_updates=%s.",
-            log_prefix(request_id=request_id),
-            len(jobs),
-            total_items,
-            total_updates,
-        )
-        logger.info(
-            "%s Inventory pipeline completed successfully for request_id=%s.",
-            log_prefix(request_id=request_id),
-            request_id,
-        )
-    except Exception as exc:
-        logger.exception(
-            "%s Background inventory pipeline failed: %s",
-            log_prefix(request_id=request_id),
-            exc,
-        )
-
-
-@app.get("/health")
-def healthcheck():
-    return jsonify({"status": "ok"})
-
-
-@app.post("/inventory-pipeline/trigger")
-def trigger_inventory_pipeline():
-    request_id = uuid.uuid4().hex[:8]
-    incoming_key = request.headers.get("x-pipeline-key", "").strip()
-    if not PIPELINE_AUTH_HEADER or incoming_key != PIPELINE_AUTH_HEADER:
-        logger.warning(
-            "%s Rejecting request due to missing/invalid x-pipeline-key header.",
-            log_prefix(request_id=request_id),
-        )
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "message": "Unauthorized: invalid or missing x-pipeline-key header.",
-                }
-            ),
-            401,
-        )
-
-    payload = request.get_json(silent=True)
-    if payload is None:
-        logger.warning("%s Rejecting request due to invalid JSON body.", log_prefix(request_id=request_id))
-        return jsonify({"success": False, "message": "Invalid JSON body."}), 400
-
-    try:
-        jobs, is_batch = parse_payload(payload)
-        logger.info(
-            "%s Accepted inventory trigger with %s brand job(s).",
-            log_prefix(request_id=request_id),
-            len(jobs),
-        )
-        background_thread = threading.Thread(
-            target=process_brand_jobs_in_background,
-            args=(jobs, request_id),
-            daemon=True,
-        )
-        background_thread.start()
-
-        total_items = sum(len(job.items) for job in jobs)
-        return (
-            jsonify(
-                {
-                    "success": True,
-                    "message": "Inventory pipeline accepted and started.",
-                    "data": {
-                        "request_id": request_id,
-                        "brand_job_count": len(jobs),
-                        "received_count": total_items,
-                        "mode": "batch" if is_batch else "single",
-                        "status": "started",
-                    },
-                }
-            ),
-            202,
-        )
-    except ValueError as exc:
-        logger.warning(
-            "%s Payload validation failed: %s",
-            log_prefix(request_id=request_id),
-            exc,
-        )
-        return jsonify({"success": False, "message": str(exc)}), 400
-    except Exception as exc:
-        logger.exception("%s Inventory pipeline failed: %s", log_prefix(request_id=request_id), exc)
-        return jsonify({"success": False, "message": "Internal server error."}), 500
+        while True:
+            time.sleep(60)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("%s Shutdown signal received.", log_prefix())
+        stop_event.set()
+        for worker in workers:
+            worker.join(timeout=5)
+        logger.info("%s Inventory Redis worker service stopped.", log_prefix())
 
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "8050")),
-        debug=os.environ.get("FLASK_DEBUG", "false").strip().lower() == "true",
-    )
+    main()
