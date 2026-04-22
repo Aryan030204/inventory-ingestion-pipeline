@@ -21,8 +21,11 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from dotenv import load_dotenv
 from mysql.connector import pooling
+from flask import Flask, request, jsonify
 
 load_dotenv()
+
+app = Flask(__name__)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -967,6 +970,27 @@ def ingestion_worker(stop_event: threading.Event) -> None:
         stop_event.wait(max(1, INGESTION_POLL_SECONDS))
 
 
+def run_manual_trigger():
+    logger.info("%s Manual trigger started.", log_prefix())
+    try:
+        redis_client = get_redis_client()
+        run_calculation_cycle(redis_client)
+        run_ingestion_cycle(redis_client, reason="manual-trigger")
+        logger.info("%s Manual trigger completed successfully.", log_prefix())
+    except Exception as exc:
+        logger.exception("%s Manual trigger failed: %s", log_prefix(), exc)
+
+
+@app.route("/trigger", methods=["POST"])
+def trigger_pipeline():
+    auth_key = request.headers.get("x-pipeline-key")
+    if not auth_key or auth_key != PIPELINE_AUTH_HEADER:
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+    threading.Thread(target=run_manual_trigger, daemon=True).start()
+    return jsonify({"status": "success", "message": "Pipeline triggered"}), 202
+
+
 def validate_environment() -> None:
     missing = []
     if not REDIS_URI:
@@ -983,20 +1007,25 @@ def main() -> None:
     validate_environment()
     load_brand_context_cache(force=True)
 
+    self_run = os.environ.get("SELF_RUN", "true").strip().lower() == "true"
     stop_event = threading.Event()
-    workers = [
-        threading.Thread(target=calculation_worker, args=(stop_event,), daemon=True),
-        threading.Thread(target=ingestion_worker, args=(stop_event,), daemon=True),
-    ]
+    workers = []
 
-    for worker in workers:
-        worker.start()
-
-    logger.info("%s Inventory Redis worker service started.", log_prefix())
+    if self_run:
+        workers = [
+            threading.Thread(target=calculation_worker, args=(stop_event,), daemon=True),
+            threading.Thread(target=ingestion_worker, args=(stop_event,), daemon=True),
+        ]
+        for worker in workers:
+            worker.start()
+        logger.info("%s Inventory Redis worker service started (SELF_RUN=true).", log_prefix())
+    else:
+        logger.info("%s Inventory Redis worker service started (SELF_RUN=false, manual trigger only).", log_prefix())
 
     try:
-        while True:
-            time.sleep(60)
+        # Start Flask server
+        port = int(os.environ.get("PORT", 8050))
+        app.run(host="0.0.0.0", port=port)
     except (KeyboardInterrupt, SystemExit):
         logger.info("%s Shutdown signal received.", log_prefix())
         stop_event.set()
