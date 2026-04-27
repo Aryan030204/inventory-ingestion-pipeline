@@ -971,14 +971,13 @@ def ingestion_worker(stop_event: threading.Event) -> None:
 
 
 def run_manual_trigger():
-    logger.info("%s Manual trigger started.", log_prefix())
+    logger.info("%s Manual ingestion trigger started.", log_prefix())
     try:
         redis_client = get_redis_client()
-        run_calculation_cycle(redis_client)
         run_ingestion_cycle(redis_client, reason="manual-trigger")
-        logger.info("%s Manual trigger completed successfully.", log_prefix())
+        logger.info("%s Manual ingestion trigger completed successfully.", log_prefix())
     except Exception as exc:
-        logger.exception("%s Manual trigger failed: %s", log_prefix(), exc)
+        logger.exception("%s Manual ingestion trigger failed: %s", log_prefix(), exc)
 
 
 @app.route("/trigger", methods=["POST"])
@@ -1009,18 +1008,29 @@ def main() -> None:
 
     self_run = os.environ.get("SELF_RUN", "true").strip().lower() == "true"
     stop_event = threading.Event()
-    workers = []
+    workers = [
+        threading.Thread(target=calculation_worker, args=(stop_event,), daemon=True),
+    ]
+
+    # Calculation worker always runs. SELF_RUN controls only ingestion scheduling.
+    if self_run:
+        workers.append(
+            threading.Thread(target=ingestion_worker, args=(stop_event,), daemon=True)
+        )
+
+    for worker in workers:
+        worker.start()
 
     if self_run:
-        workers = [
-            threading.Thread(target=calculation_worker, args=(stop_event,), daemon=True),
-            threading.Thread(target=ingestion_worker, args=(stop_event,), daemon=True),
-        ]
-        for worker in workers:
-            worker.start()
-        logger.info("%s Inventory Redis worker service started (SELF_RUN=true).", log_prefix())
+        logger.info(
+            "%s Inventory Redis worker service started (ingestion self-run enabled).",
+            log_prefix(),
+        )
     else:
-        logger.info("%s Inventory Redis worker service started (SELF_RUN=false, manual trigger only).", log_prefix())
+        logger.info(
+            "%s Inventory Redis worker service started (ingestion manual-trigger only).",
+            log_prefix(),
+        )
 
     try:
         # Start Flask server
