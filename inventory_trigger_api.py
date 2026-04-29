@@ -6,6 +6,7 @@ import re
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -24,6 +25,18 @@ from mysql.connector import pooling
 from flask import Flask, request, jsonify
 
 load_dotenv()
+
+
+def _is_truthy_env(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+
+TEST_MODE = _is_truthy_env(os.environ.get("TEST_MODE"))
+
+if TEST_MODE:
+    load_dotenv(".env.local", override=False)
 
 app = Flask(__name__)
 
@@ -169,7 +182,49 @@ def resolve_ca_bundle_path() -> Optional[str]:
     return certifi.where()
 
 
+def _get_local_brand_indices() -> List[int]:
+    indices: List[int] = []
+    total_raw = os.environ.get("TOTAL_CONFIG_COUNT", "").strip()
+    if total_raw.isdigit():
+        for idx in range(int(total_raw)):
+            if os.environ.get(f"BRAND_ID_{idx}"):
+                indices.append(idx)
+        return indices
+
+    for key in os.environ.keys():
+        match = re.match(r"^BRAND_ID_(\d+)$", key)
+        if match:
+            indices.append(int(match.group(1)))
+    return sorted(set(indices))
+
+
+def _get_local_brand_index(brand_id: int) -> int:
+    for idx in _get_local_brand_indices():
+        raw_id = os.environ.get(f"BRAND_ID_{idx}")
+        if raw_id and int(raw_id) == brand_id:
+            return idx
+    raise ValueError(f"Brand config not found for brand_id={brand_id} in .env.local")
+
+
 def fetch_active_brands() -> Dict[str, str]:
+    if TEST_MODE:
+        active_raw = os.environ.get("ACTIVE_BRAND_IDS", "").strip()
+        active_ids = {
+            value.strip()
+            for value in active_raw.split(",")
+            if value.strip()
+        }
+        brand_map: Dict[str, str] = {}
+        for idx in _get_local_brand_indices():
+            brand_id = (os.environ.get(f"BRAND_ID_{idx}") or "").strip()
+            if not brand_id:
+                continue
+            if active_ids and brand_id not in active_ids:
+                continue
+            shop_name = (os.environ.get(f"SHOP_NAME_{idx}") or "").strip()
+            brand_map[brand_id] = shop_name
+        return brand_map
+
     if not GET_BRANDS_API or not PIPELINE_AUTH_HEADER:
         raise RuntimeError("GET_BRANDS_API or PIPELINE_AUTH_HEADER is not configured.")
 
@@ -183,6 +238,19 @@ def fetch_active_brands() -> Dict[str, str]:
 
 
 def fetch_brand_config(brand_id: int) -> Dict[str, Any]:
+    if TEST_MODE:
+        idx = _get_local_brand_index(brand_id)
+        return {
+            "brand_tag": (os.environ.get(f"BRAND_TAG_{idx}") or str(brand_id)).strip(),
+            "brand_name": (os.environ.get(f"BRAND_NAME_{idx}") or str(brand_id)).strip(),
+            "db_database": (os.environ.get(f"DB_DATABASE_{idx}") or "").strip(),
+            "shop_name": (os.environ.get(f"SHOP_NAME_{idx}") or "").strip(),
+            "db_host": (os.environ.get(f"DB_HOST_{idx}") or "").strip(),
+            "db_user": (os.environ.get(f"DB_USER_{idx}") or "").strip(),
+            "db_password": (os.environ.get(f"DB_PASSWORD_{idx}") or "").strip(),
+            "port": int((os.environ.get(f"DB_PORT_{idx}") or "3306").strip()),
+        }
+
     if not GET_BRANDS_API or not PIPELINE_AUTH_HEADER:
         raise RuntimeError("GET_BRANDS_API or PIPELINE_AUTH_HEADER is not configured.")
 
@@ -970,14 +1038,49 @@ def ingestion_worker(stop_event: threading.Event) -> None:
         stop_event.wait(max(1, INGESTION_POLL_SECONDS))
 
 
-def run_manual_trigger():
-    logger.info("%s Manual ingestion trigger started.", log_prefix())
+def send_lifecycle_event(run_id: str, status: str) -> None:
+    if status == "running":
+        manager_endpoint = os.environ.get("MANAGER_STARTED_ENDPOINT", "").strip()
+    elif status == "completed":
+        manager_endpoint = os.environ.get("MANAGER_COMPLETED_ENDPOINT", "").strip()
+    else:
+        logger.warning("%s Unknown lifecycle status %s.", log_prefix(), status)
+        return
+
+    pipeline_id = os.environ.get("PIPELINE_ID", "").strip()
+
+    if not manager_endpoint or not pipeline_id:
+        logger.warning("%s Endpoint or PIPELINE_ID missing. Skipping lifecycle event %s.", log_prefix(), status)
+        return
+
+    payload = {
+        "runId": run_id,
+        "pipelineId": pipeline_id,
+        "status": status
+    }
+    headers = {"Content-Type": "application/json"}
+    if PIPELINE_AUTH_HEADER:
+        headers["x-pipeline-key"] = PIPELINE_AUTH_HEADER
+
+    try:
+        response = requests.post(manager_endpoint, json=payload, headers=headers, timeout=10)
+        response.raise_for_status()
+        logger.info("%s Sent lifecycle event: %s for runId: %s", log_prefix(), status, run_id)
+    except Exception as exc:
+        logger.error("%s Failed to send lifecycle event %s: %s", log_prefix(), status, exc)
+
+
+def run_manual_trigger(run_id: str):
+    logger.info("%s Manual ingestion trigger started. runId=%s", log_prefix(), run_id)
+    send_lifecycle_event(run_id, "running")
     try:
         redis_client = get_redis_client()
         run_ingestion_cycle(redis_client, reason="manual-trigger")
         logger.info("%s Manual ingestion trigger completed successfully.", log_prefix())
     except Exception as exc:
         logger.exception("%s Manual ingestion trigger failed: %s", log_prefix(), exc)
+    finally:
+        send_lifecycle_event(run_id, "completed")
 
 
 @app.route("/trigger", methods=["POST"])
@@ -986,18 +1089,20 @@ def trigger_pipeline():
     if not auth_key or auth_key != PIPELINE_AUTH_HEADER:
         return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
-    threading.Thread(target=run_manual_trigger, daemon=True).start()
-    return jsonify({"status": "success", "message": "Pipeline triggered"}), 202
+    run_id = uuid.uuid4().hex
+    threading.Thread(target=run_manual_trigger, args=(run_id,), daemon=True).start()
+    return jsonify({"status": "success", "message": "Pipeline triggered", "runId": run_id}), 202
 
 
 def validate_environment() -> None:
     missing = []
     if not REDIS_URI:
         missing.append("REDIS_URI")
-    if not GET_BRANDS_API:
-        missing.append("GET_BRANDS_API")
-    if not PIPELINE_AUTH_HEADER:
-        missing.append("PIPELINE_AUTH_HEADER")
+    if not TEST_MODE:
+        if not GET_BRANDS_API:
+            missing.append("GET_BRANDS_API")
+        if not PIPELINE_AUTH_HEADER:
+            missing.append("PIPELINE_AUTH_HEADER")
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
