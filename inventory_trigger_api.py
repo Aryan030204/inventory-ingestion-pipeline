@@ -6,7 +6,7 @@ import re
 import tempfile
 import threading
 import time
-import uuid
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -1070,16 +1070,79 @@ def send_lifecycle_event(run_id: str, status: str) -> None:
         logger.error("%s Failed to send lifecycle event %s: %s", log_prefix(), status, exc)
 
 
+def _derive_error_code(exc: Exception) -> str:
+    name = exc.__class__.__name__
+    if not name:
+        return "UNKNOWN_ERROR"
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")
+    return normalized.upper() if normalized else "UNKNOWN_ERROR"
+
+
+def _build_error_body(log_tail: deque, exc: Exception) -> str:
+    if log_tail:
+        return "\n".join(log_tail)
+    fallback = str(exc).strip()
+    return fallback if fallback else repr(exc)
+
+
+def send_failed_event(run_id: str, error_code: str, error_body: str) -> None:
+    manager_endpoint = os.environ.get("MANAGER_FAILED_ENDPOINT", "").strip()
+    pipeline_id = os.environ.get("PIPELINE_ID", "").strip()
+
+    if not manager_endpoint or not pipeline_id:
+        logger.warning("%s Failed endpoint or PIPELINE_ID missing. Skipping failed event.", log_prefix())
+        return
+
+    payload = {
+        "runId": run_id,
+        "pipelineId": pipeline_id,
+        "errorCode": error_code,
+        "errorBody": error_body,
+    }
+    headers = {"Content-Type": "application/json"}
+    if PIPELINE_AUTH_HEADER:
+        headers["x-pipeline-key"] = PIPELINE_AUTH_HEADER
+
+    try:
+        response = requests.post(manager_endpoint, json=payload, headers=headers, timeout=10)
+        response.raise_for_status()
+        logger.info("%s Sent failed event for runId: %s", log_prefix(), run_id)
+    except Exception as exc:
+        logger.error("%s Failed to send failed event: %s", log_prefix(), exc)
+
+
 def run_manual_trigger(run_id: str):
+    log_tail: deque[str] = deque(maxlen=2)
+    handler = logging.Handler()
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+    )
+
+    def _emit(record: logging.LogRecord) -> None:
+        log_tail.append(handler.format(record))
+
+    handler.emit = _emit  # type: ignore[assignment]
+    logger.addHandler(handler)
+
+    success = False
     logger.info("%s Manual ingestion trigger started. runId=%s", log_prefix(), run_id)
     send_lifecycle_event(run_id, "running")
     try:
         redis_client = get_redis_client()
         run_ingestion_cycle(redis_client, reason="manual-trigger")
         logger.info("%s Manual ingestion trigger completed successfully.", log_prefix())
+        success = True
     except Exception as exc:
         logger.exception("%s Manual ingestion trigger failed: %s", log_prefix(), exc)
+        error_code = _derive_error_code(exc)
+        error_body = _build_error_body(log_tail, exc)
+        send_failed_event(run_id, error_code, error_body)
     finally:
+        logger.removeHandler(handler)
+        handler.close()
+
+    if success:
         send_lifecycle_event(run_id, "completed")
 
 
@@ -1089,7 +1152,11 @@ def trigger_pipeline():
     if not auth_key or auth_key != PIPELINE_AUTH_HEADER:
         return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
-    run_id = uuid.uuid4().hex
+    payload = request.get_json(silent=True) or {}
+    run_id = str(payload.get("runId") or "").strip()
+    if not run_id:
+        return jsonify({"status": "error", "message": "runId is required"}), 400
+
     threading.Thread(target=run_manual_trigger, args=(run_id,), daemon=True).start()
     return jsonify({"status": "success", "message": "Pipeline triggered", "runId": run_id}), 202
 
