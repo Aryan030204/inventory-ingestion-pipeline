@@ -673,8 +673,8 @@ def parse_ready_item(raw_doc: Dict[str, Any], shop_domain_hint: str) -> Calculat
         variant_title=str(raw_doc.get("variant_title") or "").strip(),
         sku=(str(raw_doc.get("sku")).strip() if raw_doc.get("sku") is not None else None),
         inventory_quantity=max(int(raw_doc.get("inventory_quantity") or 0), 0),
-        sold_units_7d=max(int(raw_doc.get("sold_units_7d") or 0), 0),
-        sold_units_30d=max(int(raw_doc.get("sold_units_30d") or 0), 0),
+        sold_units_7d=int(raw_doc.get("sold_units_7d") or 0),
+        sold_units_30d=int(raw_doc.get("sold_units_30d") or 0),
         drr_7d=Decimal(str(raw_doc.get("drr_7d") or "0")),
         drr_30d=Decimal(str(raw_doc.get("drr_30d") or "0")),
     )
@@ -743,47 +743,230 @@ def should_trigger_ingestion(redis_client: redis.Redis) -> bool:
     return False
 
 
-def bulk_fetch_sold_units(cursor, product_ids: Sequence[int]) -> Dict[int, Dict[str, int]]:
-    if not product_ids:
-        return {}
-
+def _build_sold_units_query(
+    product_ids: Sequence[int], report_end_date, calculate_30d: bool
+) -> Tuple[str, Tuple[Any, ...]]:
     placeholders = ", ".join(["%s"] * len(product_ids))
-    end_date = datetime.utcnow().date() - timedelta(days=1)
-    start_7d = (end_date - timedelta(days=6)).isoformat()
-    end_date_str = end_date.isoformat()
-    query_params: List[Any] = [start_7d, end_date_str]
-    sold_units_30d_sql = "0 AS sold_units_30d"
-    where_start_date = start_7d
+    end_date_str = report_end_date.isoformat()
+    start_7d = (report_end_date - timedelta(days=6)).isoformat()
 
-    if CALCULATE_30D:
-        start_30d = (end_date - timedelta(days=29)).isoformat()
-        sold_units_30d_sql = (
-            "SUM(CASE WHEN created_date >= %s AND created_date <= %s "
-            "THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_30d"
+    if not calculate_30d:
+        sql = f"""
+        WITH window_orders AS (
+            SELECT
+                order_id,
+                product_id,
+                COALESCE(line_item_quantity, 0) AS line_item_quantity
+            FROM shopify_orders
+            WHERE created_date >= %s
+              AND created_date <= %s
+              AND product_id IN ({placeholders})
+        ),
+        gross_sales AS (
+            SELECT
+                product_id,
+                SUM(line_item_quantity) AS gross_sold_units_7d
+            FROM window_orders
+            GROUP BY product_id
+        ),
+        reversal_orders AS (
+            SELECT DISTINCT
+                order_id
+            FROM returns_fact
+            WHERE event_date >= %s
+              AND event_date <= %s
+              AND event_type IN ('REFUND', 'CANCEL', 'CANCEL (RTO)')
+        ),
+        order_products AS (
+            SELECT
+                order_id,
+                product_id,
+                SUM(line_item_quantity) AS line_item_quantity
+            FROM window_orders
+            GROUP BY
+                order_id,
+                product_id
+        ),
+        reversed_sales AS (
+            SELECT
+                op.product_id,
+                SUM(op.line_item_quantity) AS reversed_units_7d
+            FROM order_products op
+            INNER JOIN reversal_orders ro
+                ON ro.order_id = op.order_id
+            GROUP BY op.product_id
         )
-        query_params.extend([start_30d, end_date_str])
-        where_start_date = start_30d
-
-    cursor.execute(
-        f"""
         SELECT
+            gs.product_id,
+            gs.gross_sold_units_7d - COALESCE(rs.reversed_units_7d, 0) AS sold_units_7d,
+            0 AS sold_units_30d,
+            gs.gross_sold_units_7d AS gross_sold_units_7d,
+            COALESCE(rs.reversed_units_7d, 0) AS reversed_units_7d,
+            0 AS gross_sold_units_30d,
+            0 AS reversed_units_30d
+        FROM gross_sales gs
+        LEFT JOIN reversed_sales rs
+            ON rs.product_id = gs.product_id
+        """
+        params = (start_7d, end_date_str, *product_ids, start_7d, end_date_str)
+        return sql, params
+
+    start_30d = (report_end_date - timedelta(days=29)).isoformat()
+    sql = f"""
+    WITH window_orders_30d AS (
+        SELECT
+            order_id,
             product_id,
-            SUM(CASE WHEN created_date >= %s AND created_date <= %s THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_7d,
-            {sold_units_30d_sql}
+            created_date,
+            COALESCE(line_item_quantity, 0) AS line_item_quantity
         FROM shopify_orders
         WHERE created_date >= %s
           AND created_date <= %s
           AND product_id IN ({placeholders})
+    ),
+    gross_sales AS (
+        SELECT
+            product_id,
+            SUM(
+                CASE
+                    WHEN created_date >= %s
+                     AND created_date <= %s
+                    THEN line_item_quantity
+                    ELSE 0
+                END
+            ) AS gross_sold_units_7d,
+            SUM(
+                CASE
+                    WHEN created_date >= %s
+                     AND created_date <= %s
+                    THEN line_item_quantity
+                    ELSE 0
+                END
+            ) AS gross_sold_units_30d
+        FROM window_orders_30d
         GROUP BY product_id
-        """,
-        tuple(query_params + [where_start_date, end_date_str, *product_ids]),
+    ),
+    reversal_orders_7d AS (
+        SELECT DISTINCT
+            order_id
+        FROM returns_fact
+        WHERE event_date >= %s
+          AND event_date <= %s
+          AND event_type IN ('REFUND', 'CANCEL', 'CANCEL (RTO)')
+    ),
+    reversal_orders_30d AS (
+        SELECT DISTINCT
+            order_id
+        FROM returns_fact
+        WHERE event_date >= %s
+          AND event_date <= %s
+          AND event_type IN ('REFUND', 'CANCEL', 'CANCEL (RTO)')
+    ),
+    order_products_30d AS (
+        SELECT
+            order_id,
+            product_id,
+            created_date,
+            SUM(line_item_quantity) AS line_item_quantity
+        FROM window_orders_30d
+        GROUP BY
+            order_id,
+            product_id,
+            created_date
+    ),
+    reversed_sales_7d AS (
+        SELECT
+            op.product_id,
+            SUM(op.line_item_quantity) AS reversed_units_7d
+        FROM order_products_30d op
+        INNER JOIN reversal_orders_7d ro
+            ON ro.order_id = op.order_id
+        WHERE op.created_date >= %s
+          AND op.created_date <= %s
+        GROUP BY op.product_id
+    ),
+    reversed_sales_30d AS (
+        SELECT
+            op.product_id,
+            SUM(op.line_item_quantity) AS reversed_units_30d
+        FROM order_products_30d op
+        INNER JOIN reversal_orders_30d ro
+            ON ro.order_id = op.order_id
+        GROUP BY op.product_id
     )
+    SELECT
+        gs.product_id,
+        gs.gross_sold_units_7d - COALESCE(r7.reversed_units_7d, 0) AS sold_units_7d,
+        gs.gross_sold_units_30d - COALESCE(r30.reversed_units_30d, 0) AS sold_units_30d,
+        gs.gross_sold_units_7d AS gross_sold_units_7d,
+        COALESCE(r7.reversed_units_7d, 0) AS reversed_units_7d,
+        gs.gross_sold_units_30d AS gross_sold_units_30d,
+        COALESCE(r30.reversed_units_30d, 0) AS reversed_units_30d
+    FROM gross_sales gs
+    LEFT JOIN reversed_sales_7d r7
+        ON r7.product_id = gs.product_id
+    LEFT JOIN reversed_sales_30d r30
+        ON r30.product_id = gs.product_id
+    """
+    params = (
+        start_30d,
+        end_date_str,
+        *product_ids,
+        start_7d,
+        end_date_str,
+        start_30d,
+        end_date_str,
+        start_7d,
+        end_date_str,
+        start_30d,
+        end_date_str,
+        start_7d,
+        end_date_str,
+    )
+    return sql, params
+
+
+def bulk_fetch_sold_units(cursor, product_ids: Sequence[int]) -> Dict[int, Dict[str, int]]:
+    if not product_ids:
+        return {}
+
+    end_date = datetime.utcnow().date() - timedelta(days=1)
+    sql, params = _build_sold_units_query(product_ids, end_date, CALCULATE_30D)
+    cursor.execute(sql, params)
 
     sold_units_by_product: Dict[int, Dict[str, int]] = {}
     for row in cursor.fetchall():
-        sold_units_by_product[int(row["product_id"])] = {
-            "sold_units_7d": int(row.get("sold_units_7d") or 0),
-            "sold_units_30d": int(row.get("sold_units_30d") or 0),
+        product_id = int(row["product_id"])
+        sold_units_7d = int(row.get("sold_units_7d") or 0)
+        sold_units_30d = int(row.get("sold_units_30d") or 0)
+        gross_units_7d = int(row.get("gross_sold_units_7d") or 0)
+        reversed_units_7d = int(row.get("reversed_units_7d") or 0)
+        gross_units_30d = int(row.get("gross_sold_units_30d") or 0)
+        reversed_units_30d = int(row.get("reversed_units_30d") or 0)
+
+        if reversed_units_7d > gross_units_7d or sold_units_7d < 0:
+            logger.warning(
+                "%s Negative or inconsistent 7d sold-units for product_id=%s gross=%s reversed=%s net=%s",
+                log_prefix(),
+                product_id,
+                gross_units_7d,
+                reversed_units_7d,
+                sold_units_7d,
+            )
+
+        if CALCULATE_30D and (reversed_units_30d > gross_units_30d or sold_units_30d < 0):
+            logger.warning(
+                "%s Negative or inconsistent 30d sold-units for product_id=%s gross=%s reversed=%s net=%s",
+                log_prefix(),
+                product_id,
+                gross_units_30d,
+                reversed_units_30d,
+                sold_units_30d,
+            )
+
+        sold_units_by_product[product_id] = {
+            "sold_units_7d": sold_units_7d,
+            "sold_units_30d": sold_units_30d,
         }
 
     return sold_units_by_product
