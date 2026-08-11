@@ -64,6 +64,7 @@ CALCULATION_BATCH_WINDOW_SECONDS = int(
 CALCULATION_BATCH_MAX_ITEMS = int(
     os.environ.get("CALCULATION_BATCH_MAX_ITEMS", "100")
 )
+CALCULATE_30D = _is_truthy_env(os.environ.get("30DAYS_CALC"))
 
 SOURCE_KEY_PREFIX = os.environ.get("INVENTORY_SOURCE_PREFIX", "product_inventory")
 READY_KEY_PREFIX = os.environ.get("INVENTORY_READY_PREFIX", "inventory_calc_ready")
@@ -110,10 +111,8 @@ class CalculatedInventoryItem:
     inventory_quantity: int
     sold_units_7d: int
     sold_units_30d: int
-    sold_units_90d: int
     drr_7d: Decimal
     drr_30d: Decimal
-    drr_90d: Decimal
 
 
 @dataclass
@@ -657,10 +656,8 @@ def serialize_ready_item(item: CalculatedInventoryItem) -> str:
             "inventory_quantity": item.inventory_quantity,
             "sold_units_7d": item.sold_units_7d,
             "sold_units_30d": item.sold_units_30d,
-            "sold_units_90d": item.sold_units_90d,
             "drr_7d": str(item.drr_7d),
             "drr_30d": str(item.drr_30d),
-            "drr_90d": str(item.drr_90d),
         },
         separators=(",", ":"),
     )
@@ -678,10 +675,8 @@ def parse_ready_item(raw_doc: Dict[str, Any], shop_domain_hint: str) -> Calculat
         inventory_quantity=max(int(raw_doc.get("inventory_quantity") or 0), 0),
         sold_units_7d=max(int(raw_doc.get("sold_units_7d") or 0), 0),
         sold_units_30d=max(int(raw_doc.get("sold_units_30d") or 0), 0),
-        sold_units_90d=max(int(raw_doc.get("sold_units_90d") or 0), 0),
         drr_7d=Decimal(str(raw_doc.get("drr_7d") or "0")),
         drr_30d=Decimal(str(raw_doc.get("drr_30d") or "0")),
-        drr_90d=Decimal(str(raw_doc.get("drr_90d") or "0")),
     )
 
 
@@ -755,34 +750,33 @@ def bulk_fetch_sold_units(cursor, product_ids: Sequence[int]) -> Dict[int, Dict[
     placeholders = ", ".join(["%s"] * len(product_ids))
     end_date = datetime.utcnow().date() - timedelta(days=1)
     start_7d = (end_date - timedelta(days=6)).isoformat()
-    start_30d = (end_date - timedelta(days=29)).isoformat()
-    start_90d = (end_date - timedelta(days=89)).isoformat()
     end_date_str = end_date.isoformat()
+    query_params: List[Any] = [start_7d, end_date_str]
+    sold_units_30d_sql = "0 AS sold_units_30d"
+    where_start_date = start_7d
+
+    if CALCULATE_30D:
+        start_30d = (end_date - timedelta(days=29)).isoformat()
+        sold_units_30d_sql = (
+            "SUM(CASE WHEN created_date >= %s AND created_date <= %s "
+            "THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_30d"
+        )
+        query_params.extend([start_30d, end_date_str])
+        where_start_date = start_30d
 
     cursor.execute(
         f"""
         SELECT
             product_id,
             SUM(CASE WHEN created_date >= %s AND created_date <= %s THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_7d,
-            SUM(CASE WHEN created_date >= %s AND created_date <= %s THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_30d,
-            SUM(CASE WHEN created_date >= %s AND created_date <= %s THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_90d
+            {sold_units_30d_sql}
         FROM shopify_orders
         WHERE created_date >= %s
           AND created_date <= %s
           AND product_id IN ({placeholders})
         GROUP BY product_id
         """,
-        (
-            start_7d,
-            end_date_str,
-            start_30d,
-            end_date_str,
-            start_90d,
-            end_date_str,
-            start_90d,
-            end_date_str,
-            *product_ids,
-        ),
+        tuple(query_params + [where_start_date, end_date_str, *product_ids]),
     )
 
     sold_units_by_product: Dict[int, Dict[str, int]] = {}
@@ -790,7 +784,6 @@ def bulk_fetch_sold_units(cursor, product_ids: Sequence[int]) -> Dict[int, Dict[
         sold_units_by_product[int(row["product_id"])] = {
             "sold_units_7d": int(row.get("sold_units_7d") or 0),
             "sold_units_30d": int(row.get("sold_units_30d") or 0),
-            "sold_units_90d": int(row.get("sold_units_90d") or 0),
         }
 
     return sold_units_by_product
@@ -807,7 +800,7 @@ def calculate_domain_items(
     for item in source_items:
         sold_units = sold_units_by_product.get(
             item.product_id,
-            {"sold_units_7d": 0, "sold_units_30d": 0, "sold_units_90d": 0},
+            {"sold_units_7d": 0, "sold_units_30d": 0},
         )
         calculated_items.append(
             CalculatedInventoryItem(
@@ -820,10 +813,10 @@ def calculate_domain_items(
                 inventory_quantity=item.inventory_quantity,
                 sold_units_7d=sold_units["sold_units_7d"],
                 sold_units_30d=sold_units["sold_units_30d"],
-                sold_units_90d=sold_units["sold_units_90d"],
                 drr_7d=compute_drr(sold_units["sold_units_7d"], 7),
-                drr_30d=compute_drr(sold_units["sold_units_30d"], 30),
-                drr_90d=compute_drr(sold_units["sold_units_90d"], 90),
+                drr_30d=compute_drr(sold_units["sold_units_30d"], 30)
+                if CALCULATE_30D
+                else Decimal("0.00"),
             )
         )
 
@@ -846,7 +839,6 @@ def upsert_top_products_inventory(
     for item in items:
         doh_7d = compute_doh(item.inventory_quantity, item.drr_7d)
         doh_30d = compute_doh(item.inventory_quantity, item.drr_30d)
-        doh_90d = compute_doh(item.inventory_quantity, item.drr_90d)
         upsert_rows.append(
             (
                 item.product_id,
@@ -857,13 +849,13 @@ def upsert_top_products_inventory(
                 item.inventory_quantity,
                 item.sold_units_7d,
                 item.sold_units_30d,
-                item.sold_units_90d,
+                0,
                 str(item.drr_7d),
                 str(item.drr_30d),
-                str(item.drr_90d),
+                "0.00",
                 str(doh_7d),
                 str(doh_30d),
-                str(doh_90d),
+                "0.00",
             )
         )
 
