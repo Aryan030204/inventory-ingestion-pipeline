@@ -753,33 +753,34 @@ def bulk_fetch_sold_units(cursor, product_ids: Sequence[int]) -> Dict[int, Dict[
         return {}
 
     placeholders = ", ".join(["%s"] * len(product_ids))
-    end_dt = datetime.utcnow()
-    start_7d = end_dt - timedelta(days=7)
-    start_30d = end_dt - timedelta(days=30)
-    start_90d = end_dt - timedelta(days=90)
+    end_date = datetime.utcnow().date() - timedelta(days=1)
+    start_7d = (end_date - timedelta(days=6)).isoformat()
+    start_30d = (end_date - timedelta(days=29)).isoformat()
+    start_90d = (end_date - timedelta(days=89)).isoformat()
+    end_date_str = end_date.isoformat()
 
     cursor.execute(
         f"""
         SELECT
             product_id,
-            SUM(CASE WHEN created_dt >= %s AND created_dt <= %s THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_7d,
-            SUM(CASE WHEN created_dt >= %s AND created_dt <= %s THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_30d,
-            SUM(CASE WHEN created_dt >= %s AND created_dt <= %s THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_90d
+            SUM(CASE WHEN created_date >= %s AND created_date <= %s THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_7d,
+            SUM(CASE WHEN created_date >= %s AND created_date <= %s THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_30d,
+            SUM(CASE WHEN created_date >= %s AND created_date <= %s THEN COALESCE(line_item_quantity, 0) ELSE 0 END) AS sold_units_90d
         FROM shopify_orders
-        WHERE created_dt >= %s
-          AND created_dt <= %s
+        WHERE created_date >= %s
+          AND created_date <= %s
           AND product_id IN ({placeholders})
         GROUP BY product_id
         """,
         (
             start_7d,
-            end_dt,
+            end_date_str,
             start_30d,
-            end_dt,
+            end_date_str,
             start_90d,
-            end_dt,
+            end_date_str,
             start_90d,
-            end_dt,
+            end_date_str,
             *product_ids,
         ),
     )
