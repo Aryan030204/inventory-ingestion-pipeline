@@ -58,6 +58,12 @@ CALCULATION_INTERVAL_MINUTES = int(
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100"))
 SCHEDULED_WINDOW_MINUTES = int(os.environ.get("SCHEDULED_WINDOW", "30"))
 INGESTION_POLL_SECONDS = int(os.environ.get("INGESTION_POLL_SECONDS", "5"))
+CALCULATION_BATCH_WINDOW_SECONDS = int(
+    os.environ.get("CALCULATION_BATCH_WINDOW_SECONDS", "30")
+)
+CALCULATION_BATCH_MAX_ITEMS = int(
+    os.environ.get("CALCULATION_BATCH_MAX_ITEMS", "100")
+)
 
 SOURCE_KEY_PREFIX = os.environ.get("INVENTORY_SOURCE_PREFIX", "product_inventory")
 READY_KEY_PREFIX = os.environ.get("INVENTORY_READY_PREFIX", "inventory_calc_ready")
@@ -69,6 +75,8 @@ _db_pools: Dict[int, Dict[str, Any]] = {}
 _brand_cache_lock = threading.Lock()
 _brand_context_by_shop_domain: Dict[str, "BrandContext"] = {}
 _brand_cache_loaded_at = 0.0
+_pending_batches_lock = threading.Lock()
+_pending_batches_by_domain: Dict[str, "PendingCalculationBatch"] = {}
 
 
 @dataclass(frozen=True)
@@ -106,6 +114,12 @@ class CalculatedInventoryItem:
     drr_7d: Decimal
     drr_30d: Decimal
     drr_90d: Decimal
+
+
+@dataclass
+class PendingCalculationBatch:
+    first_added_at: float
+    items: List[SourceInventoryItem]
 
 
 def log_prefix(brand: Optional[BrandContext] = None) -> str:
@@ -901,9 +915,77 @@ def upsert_top_products_inventory(
     return len(upsert_rows)
 
 
+def _append_pending_batch(shop_domain: str, items: Sequence[SourceInventoryItem]) -> None:
+    if not items:
+        return
+
+    now_ts = time.time()
+    with _pending_batches_lock:
+        batch = _pending_batches_by_domain.get(shop_domain)
+        if batch is None:
+            _pending_batches_by_domain[shop_domain] = PendingCalculationBatch(
+                first_added_at=now_ts,
+                items=list(items),
+            )
+            return
+
+        batch.items.extend(items)
+
+
+def _pull_due_pending_batch(shop_domain: str) -> Optional[List[SourceInventoryItem]]:
+    now_ts = time.time()
+    with _pending_batches_lock:
+        batch = _pending_batches_by_domain.get(shop_domain)
+        if batch is None:
+            return None
+
+        batch_age_s = now_ts - batch.first_added_at
+        if (
+            len(batch.items) < CALCULATION_BATCH_MAX_ITEMS
+            and batch_age_s < CALCULATION_BATCH_WINDOW_SECONDS
+        ):
+            return None
+
+        items = list(batch.items)
+        _pending_batches_by_domain.pop(shop_domain, None)
+        return items
+
+
+def _has_pending_batch(shop_domain: str) -> bool:
+    with _pending_batches_lock:
+        return shop_domain in _pending_batches_by_domain
+
+
+def _has_any_pending_batches() -> bool:
+    with _pending_batches_lock:
+        return bool(_pending_batches_by_domain)
+
+
+def _flush_domain_batch(
+    redis_client: redis.Redis, shop_domain: str, source_items: Sequence[SourceInventoryItem]
+) -> Dict[str, int]:
+    if not source_items:
+        return {"domains": 0, "source_items": 0, "ready_items": 0}
+
+    brand = resolve_brand_for_shop_domain(shop_domain)
+    calculated_items = calculate_domain_items(brand, source_items)
+    store_ready_items(redis_client, brand.shop_domain, calculated_items)
+    should_trigger_ingestion(redis_client)
+
+    return {
+        "domains": 1,
+        "source_items": len(source_items),
+        "ready_items": len(calculated_items),
+    }
+
+
 def run_calculation_cycle(redis_client: redis.Redis) -> Dict[str, int]:
     domains = scan_shop_domains(redis_client, SOURCE_KEY_PREFIX)
-    if not domains:
+    pending_domains: List[str] = []
+    with _pending_batches_lock:
+        pending_domains = list(_pending_batches_by_domain.keys())
+
+    if not domains and not pending_domains:
         logger.info("%s Calculation worker found no source inventory keys.", log_prefix())
         return {"domains": 0, "source_items": 0, "ready_items": 0}
 
@@ -911,26 +993,27 @@ def run_calculation_cycle(redis_client: redis.Redis) -> Dict[str, int]:
     source_count = 0
     ready_count = 0
 
-    for domain in domains:
+    for domain in sorted(set(domains + pending_domains)):
         source_items = pull_changed_source_items_for_domain(redis_client, domain)
-        if not source_items:
+        if source_items:
+            _append_pending_batch(domain, source_items)
+
+        batch_items = _pull_due_pending_batch(domain)
+        if not batch_items:
             continue
 
-        brand = resolve_brand_for_shop_domain(domain)
-        calculated_items = calculate_domain_items(brand, source_items)
-        store_ready_items(redis_client, brand.shop_domain, calculated_items)
-        should_trigger_ingestion(redis_client)
-
-        processed_domains += 1
-        source_count += len(source_items)
-        ready_count += len(calculated_items)
+        cycle_counts = _flush_domain_batch(redis_client, domain, batch_items)
+        processed_domains += cycle_counts["domains"]
+        source_count += cycle_counts["source_items"]
+        ready_count += cycle_counts["ready_items"]
 
     logger.info(
-        "%s Calculation cycle complete. domains=%s source_items=%s ready_items=%s",
+        "%s Calculation cycle complete. domains=%s source_items=%s ready_items=%s pending_domains=%s",
         log_prefix(),
         processed_domains,
         source_count,
         ready_count,
+        sum(1 for domain in sorted(set(domains + pending_domains)) if _has_pending_batch(domain)),
     )
     return {
         "domains": processed_domains,
@@ -1006,7 +1089,10 @@ def calculation_worker(stop_event: threading.Event) -> None:
             logger.exception("%s calculationWorker failed: %s", log_prefix(), exc)
 
         elapsed = time.time() - cycle_started_at
-        sleep_for = max(1, CALCULATION_INTERVAL_MINUTES * 60 - int(elapsed))
+        if _has_any_pending_batches():
+            sleep_for = max(1, CALCULATION_BATCH_WINDOW_SECONDS - int(elapsed))
+        else:
+            sleep_for = max(1, CALCULATION_INTERVAL_MINUTES * 60 - int(elapsed))
         stop_event.wait(sleep_for)
 
 
