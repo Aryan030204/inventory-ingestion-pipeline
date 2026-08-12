@@ -743,6 +743,19 @@ def should_trigger_ingestion(redis_client: redis.Redis) -> bool:
     return False
 
 
+def _variant_sales_key(product_id: Any, variant_id: Any) -> Optional[Tuple[int, int]]:
+    try:
+        normalized_product_id = int(product_id)
+        normalized_variant_id = int(variant_id)
+    except (TypeError, ValueError):
+        return None
+
+    if normalized_product_id <= 0 or normalized_variant_id <= 0:
+        return None
+
+    return normalized_product_id, normalized_variant_id
+
+
 def _build_sold_units_query(
     product_ids: Sequence[int], report_end_date, calculate_30d: bool
 ) -> Tuple[str, Tuple[Any, ...]]:
@@ -756,6 +769,7 @@ def _build_sold_units_query(
             SELECT
                 order_id,
                 product_id,
+                variant_id,
                 COALESCE(line_item_quantity, 0) AS line_item_quantity
             FROM shopify_orders
             WHERE created_date >= %s
@@ -765,9 +779,10 @@ def _build_sold_units_query(
         gross_sales AS (
             SELECT
                 product_id,
+                variant_id,
                 SUM(line_item_quantity) AS gross_sold_units_7d
             FROM window_orders
-            GROUP BY product_id
+            GROUP BY product_id, variant_id
         ),
         reversal_orders AS (
             SELECT DISTINCT
@@ -781,23 +796,27 @@ def _build_sold_units_query(
             SELECT
                 order_id,
                 product_id,
+                variant_id,
                 SUM(line_item_quantity) AS line_item_quantity
             FROM window_orders
             GROUP BY
                 order_id,
-                product_id
+                product_id,
+                variant_id
         ),
         reversed_sales AS (
             SELECT
                 op.product_id,
+                op.variant_id,
                 SUM(op.line_item_quantity) AS reversed_units_7d
             FROM order_products op
             INNER JOIN reversal_orders ro
                 ON ro.order_id = op.order_id
-            GROUP BY op.product_id
+            GROUP BY op.product_id, op.variant_id
         )
         SELECT
             gs.product_id,
+            gs.variant_id,
             gs.gross_sold_units_7d - COALESCE(rs.reversed_units_7d, 0) AS sold_units_7d,
             0 AS sold_units_30d,
             gs.gross_sold_units_7d AS gross_sold_units_7d,
@@ -807,6 +826,7 @@ def _build_sold_units_query(
         FROM gross_sales gs
         LEFT JOIN reversed_sales rs
             ON rs.product_id = gs.product_id
+           AND rs.variant_id = gs.variant_id
         """
         params = (start_7d, end_date_str, *product_ids, start_7d, end_date_str)
         return sql, params
@@ -817,6 +837,7 @@ def _build_sold_units_query(
         SELECT
             order_id,
             product_id,
+            variant_id,
             created_date,
             COALESCE(line_item_quantity, 0) AS line_item_quantity
         FROM shopify_orders
@@ -827,6 +848,7 @@ def _build_sold_units_query(
     gross_sales AS (
         SELECT
             product_id,
+            variant_id,
             SUM(
                 CASE
                     WHEN created_date >= %s
@@ -844,7 +866,7 @@ def _build_sold_units_query(
                 END
             ) AS gross_sold_units_30d
         FROM window_orders_30d
-        GROUP BY product_id
+        GROUP BY product_id, variant_id
     ),
     reversal_orders_7d AS (
         SELECT DISTINCT
@@ -866,36 +888,41 @@ def _build_sold_units_query(
         SELECT
             order_id,
             product_id,
+            variant_id,
             created_date,
             SUM(line_item_quantity) AS line_item_quantity
         FROM window_orders_30d
         GROUP BY
             order_id,
             product_id,
+            variant_id,
             created_date
     ),
     reversed_sales_7d AS (
         SELECT
             op.product_id,
+            op.variant_id,
             SUM(op.line_item_quantity) AS reversed_units_7d
         FROM order_products_30d op
         INNER JOIN reversal_orders_7d ro
             ON ro.order_id = op.order_id
         WHERE op.created_date >= %s
           AND op.created_date <= %s
-        GROUP BY op.product_id
+        GROUP BY op.product_id, op.variant_id
     ),
     reversed_sales_30d AS (
         SELECT
             op.product_id,
+            op.variant_id,
             SUM(op.line_item_quantity) AS reversed_units_30d
         FROM order_products_30d op
         INNER JOIN reversal_orders_30d ro
             ON ro.order_id = op.order_id
-        GROUP BY op.product_id
+        GROUP BY op.product_id, op.variant_id
     )
     SELECT
         gs.product_id,
+        gs.variant_id,
         gs.gross_sold_units_7d - COALESCE(r7.reversed_units_7d, 0) AS sold_units_7d,
         gs.gross_sold_units_30d - COALESCE(r30.reversed_units_30d, 0) AS sold_units_30d,
         gs.gross_sold_units_7d AS gross_sold_units_7d,
@@ -905,8 +932,10 @@ def _build_sold_units_query(
     FROM gross_sales gs
     LEFT JOIN reversed_sales_7d r7
         ON r7.product_id = gs.product_id
+       AND r7.variant_id = gs.variant_id
     LEFT JOIN reversed_sales_30d r30
         ON r30.product_id = gs.product_id
+       AND r30.variant_id = gs.variant_id
     """
     params = (
         start_30d,
@@ -926,17 +955,34 @@ def _build_sold_units_query(
     return sql, params
 
 
-def bulk_fetch_sold_units(cursor, product_ids: Sequence[int]) -> Dict[int, Dict[str, int]]:
-    if not product_ids:
+def bulk_fetch_sold_units(
+    cursor, variant_pairs: Sequence[Tuple[int, int]]
+) -> Dict[Tuple[int, int], Dict[str, int]]:
+    if not variant_pairs:
         return {}
 
+    requested_variant_keys = set(variant_pairs)
+    product_ids = sorted({product_id for product_id, _variant_id in requested_variant_keys})
     end_date = datetime.utcnow().date() - timedelta(days=1)
     sql, params = _build_sold_units_query(product_ids, end_date, CALCULATE_30D)
     cursor.execute(sql, params)
 
-    sold_units_by_product: Dict[int, Dict[str, int]] = {}
+    sold_units_by_variant: Dict[Tuple[int, int], Dict[str, int]] = {}
     for row in cursor.fetchall():
-        product_id = int(row["product_id"])
+        variant_key = _variant_sales_key(row.get("product_id"), row.get("variant_id"))
+        if variant_key is None:
+            logger.warning(
+                "%s Skipping malformed sold-units row product_id=%s variant_id=%s",
+                log_prefix(),
+                row.get("product_id"),
+                row.get("variant_id"),
+            )
+            continue
+
+        if variant_key not in requested_variant_keys:
+            continue
+
+        product_id, variant_id = variant_key
         sold_units_7d = int(row.get("sold_units_7d") or 0)
         sold_units_30d = int(row.get("sold_units_30d") or 0)
         gross_units_7d = int(row.get("gross_sold_units_7d") or 0)
@@ -946,9 +992,10 @@ def bulk_fetch_sold_units(cursor, product_ids: Sequence[int]) -> Dict[int, Dict[
 
         if reversed_units_7d > gross_units_7d or sold_units_7d < 0:
             logger.warning(
-                "%s Negative or inconsistent 7d sold-units for product_id=%s gross=%s reversed=%s net=%s",
+                "%s Negative or inconsistent 7d sold-units for product_id=%s variant_id=%s gross=%s reversed=%s net=%s",
                 log_prefix(),
                 product_id,
+                variant_id,
                 gross_units_7d,
                 reversed_units_7d,
                 sold_units_7d,
@@ -956,35 +1003,59 @@ def bulk_fetch_sold_units(cursor, product_ids: Sequence[int]) -> Dict[int, Dict[
 
         if CALCULATE_30D and (reversed_units_30d > gross_units_30d or sold_units_30d < 0):
             logger.warning(
-                "%s Negative or inconsistent 30d sold-units for product_id=%s gross=%s reversed=%s net=%s",
+                "%s Negative or inconsistent 30d sold-units for product_id=%s variant_id=%s gross=%s reversed=%s net=%s",
                 log_prefix(),
                 product_id,
+                variant_id,
                 gross_units_30d,
                 reversed_units_30d,
                 sold_units_30d,
             )
 
-        sold_units_by_product[product_id] = {
+        sold_units_by_variant[variant_key] = {
             "sold_units_7d": sold_units_7d,
             "sold_units_30d": sold_units_30d,
         }
 
-    return sold_units_by_product
+    return sold_units_by_variant
 
 
 def calculate_domain_items(
     brand: BrandContext, source_items: Sequence[SourceInventoryItem]
 ) -> List[CalculatedInventoryItem]:
-    product_ids = sorted({item.product_id for item in source_items})
+    variant_pairs: List[Tuple[int, int]] = []
+    for item in source_items:
+        variant_key = _variant_sales_key(item.product_id, item.variant_id)
+        if variant_key is None:
+            logger.warning(
+                "%s Invalid inventory identifiers for sales lookup product_id=%s variant_id=%s",
+                log_prefix(brand),
+                item.product_id,
+                item.variant_id,
+            )
+            continue
+        variant_pairs.append(variant_key)
+
+    unique_variant_pairs = sorted(set(variant_pairs))
     with get_db_cursor(brand.brand_id) as (_, cursor, _connection):
-        sold_units_by_product = bulk_fetch_sold_units(cursor, product_ids)
+        sold_units_by_variant = bulk_fetch_sold_units(cursor, unique_variant_pairs)
 
     calculated_items: List[CalculatedInventoryItem] = []
     for item in source_items:
-        sold_units = sold_units_by_product.get(
-            item.product_id,
-            {"sold_units_7d": 0, "sold_units_30d": 0},
-        )
+        variant_key = _variant_sales_key(item.product_id, item.variant_id)
+        if variant_key is None:
+            logger.warning(
+                "%s Falling back to zero sold-units for malformed inventory row product_id=%s variant_id=%s",
+                log_prefix(brand),
+                item.product_id,
+                item.variant_id,
+            )
+            sold_units = {"sold_units_7d": 0, "sold_units_30d": 0}
+        else:
+            sold_units = sold_units_by_variant.get(
+                variant_key,
+                {"sold_units_7d": 0, "sold_units_30d": 0},
+            )
         calculated_items.append(
             CalculatedInventoryItem(
                 shop_domain=item.shop_domain,
