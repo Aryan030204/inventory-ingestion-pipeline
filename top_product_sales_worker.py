@@ -139,6 +139,15 @@ class TopProductSalesService:
         yesterday = today - timedelta(days=1)
         return today.isoformat(), yesterday.isoformat()
 
+    def get_brand_sales_window(
+        self, brand: Any, now_utc: Optional[datetime] = None
+    ) -> Tuple[str, str]:
+        now_dt = self.normalize_utc_datetime(now_utc)
+        store_now = now_dt.astimezone(ZoneInfo(brand.store_timezone))
+        end_date_exclusive = store_now.date()
+        start_date_inclusive = end_date_exclusive - timedelta(days=7)
+        return start_date_inclusive.isoformat(), end_date_exclusive.isoformat()
+
     def get_current_ist_date(self, now_utc: Optional[datetime] = None) -> str:
         now_dt = self.normalize_utc_datetime(now_utc)
         return now_dt.astimezone(TOP_PRODUCT_SALES_SCHEDULE_TIMEZONE).date().isoformat()
@@ -157,8 +166,8 @@ class TopProductSalesService:
 
     def build_top_product_sales_shopifyql(
         self,
-        yesterday_date: str,
-        today_date: str,
+        start_date_inclusive: str,
+        end_date_exclusive: str,
         limit: int = TOP_PRODUCT_SALES_PAGE_SIZE,
         offset: int = 0,
     ) -> str:
@@ -169,7 +178,7 @@ FROM sales
   GROUP BY product_id, product_title, product_variant_id, product_variant_title,
     product_variant_sku
   WITH TOTALS
-  SINCE {yesterday_date} UNTIL {today_date}
+  SINCE {start_date_inclusive} UNTIL {end_date_exclusive}
   ORDER BY gross_sales DESC
   LIMIT {limit}{offset_clause}
 VISUALIZE gross_sales TYPE table
@@ -269,8 +278,8 @@ VISUALIZE gross_sales TYPE table
     def fetch_all_top_product_sales_rows(
         self,
         brand: Any,
-        yesterday_date: str,
-        today_date: str,
+        start_date_inclusive: str,
+        end_date_exclusive: str,
         page_size: int = TOP_PRODUCT_SALES_PAGE_SIZE,
     ) -> List[Dict[str, Any]]:
         all_rows: List[Dict[str, Any]] = []
@@ -278,8 +287,8 @@ VISUALIZE gross_sales TYPE table
 
         while True:
             shopifyql_query = self.build_top_product_sales_shopifyql(
-                yesterday_date,
-                today_date,
+                start_date_inclusive,
+                end_date_exclusive,
                 limit=page_size,
                 offset=offset,
             )
@@ -370,7 +379,8 @@ VISUALIZE gross_sales TYPE table
 
     def build_top_product_sales_payload(
         self,
-        sales_date: str,
+        window_start_date: str,
+        window_end_date_exclusive: str,
         records: Sequence[TopProductSalesRecord],
         updated_at: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -385,7 +395,8 @@ VISUALIZE gross_sales TYPE table
             for record in records
         ]
         return {
-            "date": sales_date,
+            "window_start_date": window_start_date,
+            "window_end_date_exclusive": window_end_date_exclusive,
             "updated_at": updated_at
             or datetime.now(ZoneInfo("UTC"))
             .replace(microsecond=0)
@@ -406,7 +417,7 @@ VISUALIZE gross_sales TYPE table
             return None
         if not isinstance(payload, dict):
             return None
-        cached_date = payload.get("date")
+        cached_date = payload.get("window_end_date_exclusive")
         if not isinstance(cached_date, str) or not cached_date.strip():
             return None
         return cached_date.strip()
@@ -427,16 +438,21 @@ VISUALIZE gross_sales TYPE table
 
     def fetch_top_product_sales_for_brand(
         self, brand: Any, now_utc: Optional[datetime] = None
-    ) -> Tuple[str, List[TopProductSalesRecord]]:
-        today_date, yesterday_date = self.get_brand_today_and_yesterday(
+    ) -> Tuple[str, str, List[TopProductSalesRecord]]:
+        window_start_date, window_end_date_exclusive = self.get_brand_sales_window(
             brand, now_utc=now_utc
         )
         self.logger.info(
-            "%s Fetching product sales for %s.",
+            "%s Fetching product sales for %s to %s (today exclusive).",
             self.log_prefix(brand),
-            yesterday_date,
+            window_start_date,
+            window_end_date_exclusive,
         )
-        rows = self.fetch_all_top_product_sales_rows(brand, yesterday_date, today_date)
+        rows = self.fetch_all_top_product_sales_rows(
+            brand,
+            window_start_date,
+            window_end_date_exclusive,
+        )
         self.logger.info(
             "%s Shopify product sales returned %s rows.",
             self.log_prefix(brand),
@@ -444,12 +460,13 @@ VISUALIZE gross_sales TYPE table
         )
         records = self.normalize_top_product_sales_rows(rows)
         self.logger.info(
-            "%s Top %s products identified for %s.",
+            "%s Top %s products identified for %s to %s.",
             self.log_prefix(brand),
             len(records),
-            yesterday_date,
+            window_start_date,
+            window_end_date_exclusive,
         )
-        return yesterday_date, records
+        return window_start_date, window_end_date_exclusive, records
 
     def run_top_product_sales_cycle(
         self, redis_client: redis.Redis, now_utc: Optional[datetime] = None
@@ -468,31 +485,37 @@ VISUALIZE gross_sales TYPE table
 
         for brand in brands:
             try:
-                today_date, yesterday_date = self.get_brand_today_and_yesterday(
+                window_start_date, window_end_date_exclusive = self.get_brand_sales_window(
                     brand, now_utc=now_utc
                 )
                 cached_date = self.get_cached_top_product_sales_date(
                     redis_client, brand.shop_domain
                 )
-                if cached_date == yesterday_date:
+                if cached_date == window_end_date_exclusive:
                     skipped_count += 1
                     self.logger.info(
-                        "%s Top-product sales already cached for %s. Skipping.",
+                        "%s Top-product sales already cached for %s to %s. Skipping.",
                         self.log_prefix(brand),
-                        yesterday_date,
+                        window_start_date,
+                        window_end_date_exclusive,
                     )
                     continue
 
-                records_date, records = self.fetch_top_product_sales_for_brand(
+                records_window_start, records_window_end, records = self.fetch_top_product_sales_for_brand(
                     brand, now_utc=now_utc
                 )
-                payload = self.build_top_product_sales_payload(records_date, records)
+                payload = self.build_top_product_sales_payload(
+                    records_window_start,
+                    records_window_end,
+                    records,
+                )
                 key = self.cache_top_product_sales(redis_client, brand.shop_domain, payload)
                 cached_count += 1
                 self.logger.info(
-                    "%s Cached top product sales in Redis for %s at %s.",
+                    "%s Cached top product sales in Redis for %s to %s at %s.",
                     self.log_prefix(brand),
-                    today_date,
+                    records_window_start,
+                    records_window_end,
                     key,
                 )
             except Exception as exc:

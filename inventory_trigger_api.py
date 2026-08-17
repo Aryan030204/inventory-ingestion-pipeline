@@ -878,6 +878,12 @@ def _get_brand_today_and_yesterday(
     return TOP_PRODUCT_SALES_SERVICE.get_brand_today_and_yesterday(brand, now_utc)
 
 
+def get_brand_sales_window(
+    brand: BrandContext, now_utc: Optional[datetime] = None
+) -> Tuple[str, str]:
+    return TOP_PRODUCT_SALES_SERVICE.get_brand_sales_window(brand, now_utc)
+
+
 def get_current_ist_date(now_utc: Optional[datetime] = None) -> str:
     return TOP_PRODUCT_SALES_SERVICE.get_current_ist_date(now_utc)
 
@@ -887,11 +893,14 @@ def get_next_top_product_sales_run_at(now_utc: Optional[datetime] = None) -> dat
 
 
 def build_top_product_sales_shopifyql(
-    yesterday_date: str, today_date: str, limit: int = TOP_PRODUCT_SALES_PAGE_SIZE, offset: int = 0
+    start_date_inclusive: str,
+    end_date_exclusive: str,
+    limit: int = TOP_PRODUCT_SALES_PAGE_SIZE,
+    offset: int = 0,
 ) -> str:
     return TOP_PRODUCT_SALES_SERVICE.build_top_product_sales_shopifyql(
-        yesterday_date,
-        today_date,
+        start_date_inclusive,
+        end_date_exclusive,
         limit=limit,
         offset=offset,
     )
@@ -905,14 +914,14 @@ def fetch_shopifyql_table_data(
 
 def fetch_all_top_product_sales_rows(
     brand: BrandContext,
-    yesterday_date: str,
-    today_date: str,
+    start_date_inclusive: str,
+    end_date_exclusive: str,
     page_size: int = TOP_PRODUCT_SALES_PAGE_SIZE,
 ) -> List[Dict[str, Any]]:
     return TOP_PRODUCT_SALES_SERVICE.fetch_all_top_product_sales_rows(
         brand,
-        yesterday_date,
-        today_date,
+        start_date_inclusive,
+        end_date_exclusive,
         page_size=page_size,
     )
 
@@ -928,10 +937,14 @@ def build_top_product_sales_cache_key(shop_domain: str) -> str:
 
 
 def build_top_product_sales_payload(
-    sales_date: str, records: Sequence[TopProductSalesRecord], updated_at: Optional[str] = None
+    window_start_date: str,
+    window_end_date_exclusive: str,
+    records: Sequence[TopProductSalesRecord],
+    updated_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     return TOP_PRODUCT_SALES_SERVICE.build_top_product_sales_payload(
-        sales_date,
+        window_start_date,
+        window_end_date_exclusive,
         records,
         updated_at=updated_at,
     )
@@ -959,7 +972,7 @@ def cache_top_product_sales(
 
 def fetch_top_product_sales_for_brand(
     brand: BrandContext, now_utc: Optional[datetime] = None
-) -> Tuple[str, List[TopProductSalesRecord]]:
+) -> Tuple[str, str, List[TopProductSalesRecord]]:
     return TOP_PRODUCT_SALES_SERVICE.fetch_top_product_sales_for_brand(
         brand, now_utc=now_utc
     )

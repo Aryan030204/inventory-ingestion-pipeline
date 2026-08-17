@@ -332,27 +332,27 @@ class SoldUnitsQueryTests(unittest.TestCase):
 
 
 class TopProductSalesTests(unittest.TestCase):
-    def test_brand_yesterday_uses_store_timezone(self):
+    def test_brand_sales_window_uses_store_timezone_and_excludes_today(self):
         brand = _make_brand(store_timezone="Asia/Kolkata")
-        today, yesterday = pipeline._get_brand_today_and_yesterday(
+        window_start, window_end = pipeline.get_brand_sales_window(
             brand,
             now_utc=datetime(2026, 8, 16, 20, 0, tzinfo=timezone.utc),
         )
-        self.assertEqual(today, "2026-08-17")
-        self.assertEqual(yesterday, "2026-08-16")
+        self.assertEqual(window_start, "2026-08-10")
+        self.assertEqual(window_end, "2026-08-17")
 
     def test_shopifyql_query_uses_exclusive_until_end_date(self):
         query = pipeline.build_top_product_sales_shopifyql(
-            "2026-08-16",
+            "2026-08-10",
             "2026-08-17",
         )
-        self.assertIn("SINCE 2026-08-16 UNTIL 2026-08-17", query)
-        self.assertNotIn("SINCE 2026-08-16 UNTIL 2026-08-16", query)
+        self.assertIn("SINCE 2026-08-10 UNTIL 2026-08-17", query)
+        self.assertNotIn("SINCE 2026-08-10 UNTIL 2026-08-10", query)
         self.assertIn("product_variant_sku", query)
 
     def test_shopifyql_query_supports_offset_pagination(self):
         query = pipeline.build_top_product_sales_shopifyql(
-            "2026-08-16",
+            "2026-08-10",
             "2026-08-17",
             limit=1000,
             offset=1000,
@@ -422,7 +422,7 @@ class TopProductSalesTests(unittest.TestCase):
         ) as fetch_mock:
             rows = pipeline.fetch_all_top_product_sales_rows(
                 brand,
-                "2026-08-16",
+                "2026-08-10",
                 "2026-08-17",
             )
         self.assertEqual(len(rows), 1001)
@@ -464,11 +464,12 @@ class TopProductSalesTests(unittest.TestCase):
             "fetch_shopifyql_table_data",
             side_effect=[first_page, second_page],
         ):
-            sales_date, records = pipeline.fetch_top_product_sales_for_brand(
+            window_start, window_end, records = pipeline.fetch_top_product_sales_for_brand(
                 brand,
                 now_utc=datetime(2026, 8, 16, 20, 0, tzinfo=timezone.utc),
             )
-        self.assertEqual(sales_date, "2026-08-16")
+        self.assertEqual(window_start, "2026-08-10")
+        self.assertEqual(window_end, "2026-08-17")
         self.assertEqual(records[0].product_id, 100)
         self.assertEqual(records[0].product_title, "")
         self.assertEqual(records[0].sales, Decimal("1000.00"))
@@ -508,7 +509,8 @@ class TopProductSalesTests(unittest.TestCase):
 
     def test_build_payload_contains_expected_fields(self):
         payload = pipeline.build_top_product_sales_payload(
-            "2026-08-16",
+            "2026-08-10",
+            "2026-08-17",
             [
                 pipeline.TopProductSalesRecord(
                     product_id=123,
@@ -529,7 +531,8 @@ class TopProductSalesTests(unittest.TestCase):
             ],
             updated_at="2026-08-17T00:00:00Z",
         )
-        self.assertEqual(payload["date"], "2026-08-16")
+        self.assertEqual(payload["window_start_date"], "2026-08-10")
+        self.assertEqual(payload["window_end_date_exclusive"], "2026-08-17")
         self.assertEqual(payload["updated_at"], "2026-08-17T00:00:00Z")
         self.assertEqual(
             payload["products"],
@@ -555,7 +558,12 @@ class TopProductSalesTests(unittest.TestCase):
 
     def test_cache_top_product_sales_writes_ttl(self):
         redis_client = mock.Mock()
-        payload = {"date": "2026-08-16", "updated_at": "2026-08-17T00:00:00Z", "products": []}
+        payload = {
+            "window_start_date": "2026-08-10",
+            "window_end_date_exclusive": "2026-08-17",
+            "updated_at": "2026-08-17T00:00:00Z",
+            "products": [],
+        }
         key = pipeline.cache_top_product_sales(
             redis_client,
             "test.myshopify.com",
@@ -578,7 +586,7 @@ class TopProductSalesTests(unittest.TestCase):
             with mock.patch.object(
                 pipeline.TOP_PRODUCT_SALES_SERVICE,
                 "get_cached_top_product_sales_date",
-                return_value="2026-08-16",
+                return_value="2026-08-17",
             ):
                 with mock.patch.object(
                     pipeline.TOP_PRODUCT_SALES_SERVICE,
@@ -603,13 +611,14 @@ class TopProductSalesTests(unittest.TestCase):
             with mock.patch.object(
                 pipeline.TOP_PRODUCT_SALES_SERVICE,
                 "get_cached_top_product_sales_date",
-                return_value="2026-08-15",
+                return_value="2026-08-16",
             ):
                 with mock.patch.object(
                     pipeline.TOP_PRODUCT_SALES_SERVICE,
                     "fetch_top_product_sales_for_brand",
                     return_value=(
-                        "2026-08-16",
+                        "2026-08-10",
+                        "2026-08-17",
                         [
                             pipeline.TopProductSalesRecord(
                                 product_id=123,
@@ -644,7 +653,8 @@ class TopProductSalesTests(unittest.TestCase):
             if brand.brand_id == 1:
                 raise RuntimeError("shopify failed")
             return (
-                "2026-08-16",
+                "2026-08-10",
+                "2026-08-17",
                 [
                     pipeline.TopProductSalesRecord(
                         product_id=555,
@@ -701,7 +711,8 @@ class TopProductSalesTests(unittest.TestCase):
                     pipeline.TOP_PRODUCT_SALES_SERVICE,
                     "fetch_top_product_sales_for_brand",
                     return_value=(
-                        "2026-08-16",
+                        "2026-08-10",
+                        "2026-08-17",
                         [
                             pipeline.TopProductSalesRecord(
                                 product_id=1,
