@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 import certifi
 import mysql.connector
@@ -23,6 +24,15 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from dotenv import load_dotenv
 from mysql.connector import pooling
 from flask import Flask, request, jsonify
+
+from top_product_sales_worker import (
+    DEFAULT_STORE_TIMEZONE,
+    TOP_PRODUCT_SALES_CACHE_TTL_SECONDS,
+    TOP_PRODUCT_SALES_PAGE_SIZE,
+    TOP_PRODUCT_SALES_SCHEDULE_TIMEZONE,
+    TopProductSalesRecord,
+    TopProductSalesService,
+)
 
 load_dotenv()
 
@@ -70,6 +80,7 @@ SOURCE_KEY_PREFIX = os.environ.get("INVENTORY_SOURCE_PREFIX", "product_inventory
 READY_KEY_PREFIX = os.environ.get("INVENTORY_READY_PREFIX", "inventory_calc_ready")
 READY_FLAG_KEY = os.environ.get("INVENTORY_READY_FLAG_KEY", "inventory_ingestion_ready")
 READY_COUNT_KEY = os.environ.get("INVENTORY_READY_COUNT_KEY", "inventory_calc_ready_count")
+DEFAULT_SHOPIFY_API_VERSION = "2025-10"
 
 _pool_lock = threading.Lock()
 _db_pools: Dict[int, Dict[str, Any]] = {}
@@ -87,6 +98,10 @@ class BrandContext:
     brand_name: str
     database: str
     shop_domain: str
+    shop_name: str
+    access_token: str
+    api_version: str
+    store_timezone: str
 
 
 @dataclass(frozen=True)
@@ -219,6 +234,39 @@ def _get_local_brand_index(brand_id: int) -> int:
     raise ValueError(f"Brand config not found for brand_id={brand_id} in .env.local")
 
 
+def _pick_config_value(config: Dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = config.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _normalize_store_timezone(raw_value: Any, brand_label: str) -> str:
+    candidate = str(raw_value or "").strip()
+    if candidate:
+        try:
+            ZoneInfo(candidate)
+            return candidate
+        except Exception:
+            logger.warning(
+                "%s Invalid store timezone %r. Falling back to %s.",
+                brand_label,
+                candidate,
+                DEFAULT_STORE_TIMEZONE,
+            )
+    else:
+        logger.warning(
+            "%s Store timezone missing. Falling back to %s.",
+            brand_label,
+            DEFAULT_STORE_TIMEZONE,
+        )
+    return DEFAULT_STORE_TIMEZONE
+
+
 def fetch_active_brands() -> Dict[str, str]:
     if TEST_MODE:
         active_raw = os.environ.get("ACTIVE_BRAND_IDS", "").strip()
@@ -258,6 +306,13 @@ def fetch_brand_config(brand_id: int) -> Dict[str, Any]:
             "brand_name": (os.environ.get(f"BRAND_NAME_{idx}") or str(brand_id)).strip(),
             "db_database": (os.environ.get(f"DB_DATABASE_{idx}") or "").strip(),
             "shop_name": (os.environ.get(f"SHOP_NAME_{idx}") or "").strip(),
+            "access_token": (os.environ.get(f"ACCESS_TOKEN_{idx}") or "").strip(),
+            "api_version": (os.environ.get(f"API_VERSION_{idx}") or "").strip(),
+            "store_timezone": (
+                os.environ.get(f"STORE_TIMEZONE_{idx}")
+                or os.environ.get(f"TIMEZONE_{idx}")
+                or ""
+            ).strip(),
             "db_host": (os.environ.get(f"DB_HOST_{idx}") or "").strip(),
             "db_user": (os.environ.get(f"DB_USER_{idx}") or "").strip(),
             "db_password": (os.environ.get(f"DB_PASSWORD_{idx}") or "").strip(),
@@ -293,6 +348,13 @@ def build_shop_domain(shop_name: str) -> str:
     return normalized
 
 
+def normalize_shop_name(shop_name: str) -> str:
+    normalized = normalize_shop_domain(shop_name)
+    if normalized.endswith(".myshopify.com"):
+        return normalized[: -len(".myshopify.com")]
+    return normalized
+
+
 def load_brand_context_cache(force: bool = False) -> Dict[str, BrandContext]:
     global _brand_cache_loaded_at
 
@@ -306,12 +368,32 @@ def load_brand_context_cache(force: bool = False) -> Dict[str, BrandContext]:
         for brand_id_raw in brand_map.keys():
             brand_id = int(brand_id_raw)
             config = fetch_brand_config(brand_id)
+            brand_label = f"[{config.get('brand_name', brand_id)}]"
             brand = BrandContext(
                 brand_id=brand_id,
                 brand_tag=(config.get("brand_tag") or str(brand_id)).lower(),
                 brand_name=config.get("brand_name", str(brand_id)),
                 database=config.get("db_database") or config.get("brand_tag") or str(brand_id),
                 shop_domain=build_shop_domain(config.get("shop_name", "").strip()),
+                shop_name=normalize_shop_name(config.get("shop_name", "").strip()),
+                access_token=decrypt_value(config.get("access_token", "")),
+                api_version=_pick_config_value(
+                    config,
+                    "api_version",
+                    "shopify_api_version",
+                )
+                or DEFAULT_SHOPIFY_API_VERSION,
+                store_timezone=_normalize_store_timezone(
+                    _pick_config_value(
+                        config,
+                        "store_timezone",
+                        "timezone",
+                        "time_zone",
+                        "shop_timezone",
+                        "shop_time_zone",
+                    ),
+                    brand_label,
+                ),
             )
 
             refreshed[brand.shop_domain] = brand
@@ -347,6 +429,7 @@ def resolve_brand_for_shop_domain(shop_domain: str) -> BrandContext:
 
 def build_db_config(brand_id: int) -> Tuple[BrandContext, Dict[str, Any]]:
     config = fetch_brand_config(brand_id)
+    brand_label = f"[{config.get('brand_name', brand_id)}]"
 
     return BrandContext(
         brand_id=brand_id,
@@ -354,6 +437,25 @@ def build_db_config(brand_id: int) -> Tuple[BrandContext, Dict[str, Any]]:
         brand_name=config.get("brand_name", str(brand_id)),
         database=config.get("db_database") or config.get("brand_tag") or str(brand_id),
         shop_domain=build_shop_domain(config.get("shop_name", "").strip()),
+        shop_name=normalize_shop_name(config.get("shop_name", "").strip()),
+        access_token=decrypt_value(config.get("access_token", "")),
+        api_version=_pick_config_value(
+            config,
+            "api_version",
+            "shopify_api_version",
+        )
+        or DEFAULT_SHOPIFY_API_VERSION,
+        store_timezone=_normalize_store_timezone(
+            _pick_config_value(
+                config,
+                "store_timezone",
+                "timezone",
+                "time_zone",
+                "shop_timezone",
+                "shop_time_zone",
+            ),
+            brand_label,
+        ),
     ), {
         "host": config["db_host"],
         "port": int(config.get("port", 3306)),
@@ -741,6 +843,134 @@ def should_trigger_ingestion(redis_client: redis.Redis) -> bool:
         )
         return True
     return False
+
+
+def get_active_brands() -> List[BrandContext]:
+    cache = load_brand_context_cache()
+    unique_by_brand_id: Dict[int, BrandContext] = {}
+    for brand in cache.values():
+        unique_by_brand_id[brand.brand_id] = brand
+    return [unique_by_brand_id[key] for key in sorted(unique_by_brand_id)]
+
+
+TOP_PRODUCT_SALES_SERVICE = TopProductSalesService(
+    logger=logger,
+    log_prefix=log_prefix,
+    normalize_shop_domain=normalize_shop_domain,
+    extract_numeric_gid=extract_numeric_gid,
+    quantize=quantize,
+    get_active_brands=get_active_brands,
+    get_redis_client=get_redis_client,
+)
+
+
+def _format_shopifyql_table(table_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return TOP_PRODUCT_SALES_SERVICE.format_shopifyql_table(table_data)
+
+
+def _normalize_utc_datetime(now_utc: Optional[datetime] = None) -> datetime:
+    return TOP_PRODUCT_SALES_SERVICE.normalize_utc_datetime(now_utc)
+
+
+def _get_brand_today_and_yesterday(
+    brand: BrandContext, now_utc: Optional[datetime] = None
+) -> Tuple[str, str]:
+    return TOP_PRODUCT_SALES_SERVICE.get_brand_today_and_yesterday(brand, now_utc)
+
+
+def get_current_ist_date(now_utc: Optional[datetime] = None) -> str:
+    return TOP_PRODUCT_SALES_SERVICE.get_current_ist_date(now_utc)
+
+
+def get_next_top_product_sales_run_at(now_utc: Optional[datetime] = None) -> datetime:
+    return TOP_PRODUCT_SALES_SERVICE.get_next_top_product_sales_run_at(now_utc)
+
+
+def build_top_product_sales_shopifyql(
+    yesterday_date: str, today_date: str, limit: int = TOP_PRODUCT_SALES_PAGE_SIZE, offset: int = 0
+) -> str:
+    return TOP_PRODUCT_SALES_SERVICE.build_top_product_sales_shopifyql(
+        yesterday_date,
+        today_date,
+        limit=limit,
+        offset=offset,
+    )
+
+
+def fetch_shopifyql_table_data(
+    brand: BrandContext, shopifyql_query: str
+) -> List[Dict[str, Any]]:
+    return TOP_PRODUCT_SALES_SERVICE.fetch_shopifyql_table_data(brand, shopifyql_query)
+
+
+def fetch_all_top_product_sales_rows(
+    brand: BrandContext,
+    yesterday_date: str,
+    today_date: str,
+    page_size: int = TOP_PRODUCT_SALES_PAGE_SIZE,
+) -> List[Dict[str, Any]]:
+    return TOP_PRODUCT_SALES_SERVICE.fetch_all_top_product_sales_rows(
+        brand,
+        yesterday_date,
+        today_date,
+        page_size=page_size,
+    )
+
+
+def normalize_top_product_sales_rows(
+    rows: Sequence[Dict[str, Any]],
+) -> List[TopProductSalesRecord]:
+    return TOP_PRODUCT_SALES_SERVICE.normalize_top_product_sales_rows(rows)
+
+
+def build_top_product_sales_cache_key(shop_domain: str) -> str:
+    return TOP_PRODUCT_SALES_SERVICE.build_top_product_sales_cache_key(shop_domain)
+
+
+def build_top_product_sales_payload(
+    sales_date: str, records: Sequence[TopProductSalesRecord], updated_at: Optional[str] = None
+) -> Dict[str, Any]:
+    return TOP_PRODUCT_SALES_SERVICE.build_top_product_sales_payload(
+        sales_date,
+        records,
+        updated_at=updated_at,
+    )
+
+
+def get_cached_top_product_sales_date(
+    redis_client: redis.Redis, shop_domain: str
+) -> Optional[str]:
+    return TOP_PRODUCT_SALES_SERVICE.get_cached_top_product_sales_date(
+        redis_client, shop_domain
+    )
+
+
+def cache_top_product_sales(
+    redis_client: redis.Redis,
+    shop_domain: str,
+    payload: Dict[str, Any],
+) -> str:
+    return TOP_PRODUCT_SALES_SERVICE.cache_top_product_sales(
+        redis_client,
+        shop_domain,
+        payload,
+    )
+
+
+def fetch_top_product_sales_for_brand(
+    brand: BrandContext, now_utc: Optional[datetime] = None
+) -> Tuple[str, List[TopProductSalesRecord]]:
+    return TOP_PRODUCT_SALES_SERVICE.fetch_top_product_sales_for_brand(
+        brand, now_utc=now_utc
+    )
+
+
+def run_top_product_sales_cycle(
+    redis_client: redis.Redis, now_utc: Optional[datetime] = None
+) -> Dict[str, int]:
+    return TOP_PRODUCT_SALES_SERVICE.run_top_product_sales_cycle(
+        redis_client, now_utc=now_utc
+    )
 
 
 def _variant_sales_key(product_id: Any, variant_id: Any) -> Optional[Tuple[int, int]]:
@@ -1371,6 +1601,10 @@ def ingestion_worker(stop_event: threading.Event) -> None:
         stop_event.wait(max(1, INGESTION_POLL_SECONDS))
 
 
+def top_product_sales_worker(stop_event: threading.Event) -> None:
+    TOP_PRODUCT_SALES_SERVICE.top_product_sales_worker(stop_event)
+
+
 def send_lifecycle_event(run_id: str, status: str) -> None:
     if status == "running":
         manager_endpoint = os.environ.get("MANAGER_STARTED_ENDPOINT", "").strip()
@@ -1515,6 +1749,7 @@ def main() -> None:
     stop_event = threading.Event()
     workers = [
         threading.Thread(target=calculation_worker, args=(stop_event,), daemon=True),
+        threading.Thread(target=top_product_sales_worker, args=(stop_event,), daemon=True),
     ]
 
     # Calculation worker always runs. SELF_RUN controls only ingestion scheduling.

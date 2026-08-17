@@ -13,6 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY inventory_trigger_api.py .
+COPY top_product_sales_worker.py .
 
 EXPOSE 8050
 
