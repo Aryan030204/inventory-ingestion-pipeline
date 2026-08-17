@@ -22,8 +22,10 @@ TOP_PRODUCT_SALES_PAGE_SIZE = 1000
 @dataclass(frozen=True)
 class TopProductSalesRecord:
     product_id: int
+    product_title: str
     sales: Decimal
     rank: int
+    source_rows: Tuple[Dict[str, Any], ...]
 
 
 class TopProductSalesService:
@@ -308,6 +310,8 @@ VISUALIZE gross_sales TYPE table
         self, rows: Sequence[Dict[str, Any]]
     ) -> List[TopProductSalesRecord]:
         aggregated: Dict[int, Decimal] = {}
+        product_titles: Dict[int, str] = {}
+        source_rows_by_product: Dict[int, List[Dict[str, Any]]] = {}
         for row in rows:
             try:
                 product_id = self.extract_numeric_gid(row.get("product_id"), "product_id")
@@ -320,17 +324,43 @@ VISUALIZE gross_sales TYPE table
                 sales = Decimal("0")
 
             aggregated[product_id] = aggregated.get(product_id, Decimal("0")) + sales
+            product_title = str(row.get("product_title") or "").strip()
+            if product_id not in product_titles and product_title:
+                product_titles[product_id] = product_title
+            source_rows_by_product.setdefault(product_id, []).append(
+                {
+                    "product_id": str(product_id),
+                    "product_title": product_title,
+                    "product_variant_id": str(row.get("product_variant_id") or "").strip(),
+                    "product_variant_title": str(
+                        row.get("product_variant_title") or ""
+                    ).strip(),
+                    "product_variant_sku": str(row.get("product_variant_sku") or "").strip(),
+                    "gross_sales": float(self.quantize(sales)),
+                }
+            )
 
         ranked: List[TopProductSalesRecord] = []
         for index, (product_id, sales) in enumerate(
             sorted(aggregated.items(), key=lambda item: (-item[1], item[0]))[:20],
             start=1,
         ):
+            source_rows = tuple(
+                sorted(
+                    source_rows_by_product.get(product_id, []),
+                    key=lambda row: (
+                        -float(row.get("gross_sales") or 0),
+                        row.get("product_variant_id") or "",
+                    ),
+                )
+            )
             ranked.append(
                 TopProductSalesRecord(
                     product_id=product_id,
+                    product_title=product_titles.get(product_id, ""),
                     sales=self.quantize(sales),
                     rank=index,
+                    source_rows=source_rows,
                 )
             )
         return ranked
@@ -347,8 +377,10 @@ VISUALIZE gross_sales TYPE table
         payload_products = [
             {
                 "product_id": str(record.product_id),
+                "product_title": record.product_title,
                 "sales": float(record.sales),
                 "rank": record.rank,
+                "source_rows": list(record.source_rows),
             }
             for record in records
         ]

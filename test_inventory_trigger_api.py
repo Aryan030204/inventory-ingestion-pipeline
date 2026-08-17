@@ -407,6 +407,7 @@ class TopProductSalesTests(unittest.TestCase):
         )
         self.assertEqual(len(records), 2)
         self.assertEqual(records[0].product_id, 100)
+        self.assertEqual(records[0].product_title, "")
         self.assertEqual(records[0].sales, Decimal("1250.25"))
         self.assertEqual(records[0].rank, 1)
 
@@ -469,6 +470,7 @@ class TopProductSalesTests(unittest.TestCase):
             )
         self.assertEqual(sales_date, "2026-08-16")
         self.assertEqual(records[0].product_id, 100)
+        self.assertEqual(records[0].product_title, "")
         self.assertEqual(records[0].sales, Decimal("1000.00"))
         self.assertEqual(records[1].product_id, 200)
         self.assertEqual(records[1].sales, Decimal("900.00"))
@@ -510,8 +512,19 @@ class TopProductSalesTests(unittest.TestCase):
             [
                 pipeline.TopProductSalesRecord(
                     product_id=123,
+                    product_title="Build Your Own Small Box",
                     sales=Decimal("125000.50"),
                     rank=1,
+                    source_rows=(
+                        {
+                            "product_id": "123",
+                            "product_title": "Build Your Own Small Box",
+                            "product_variant_id": "456",
+                            "product_variant_title": "Default Title",
+                            "product_variant_sku": "PCB30ML",
+                            "gross_sales": 125000.5,
+                        },
+                    ),
                 )
             ],
             updated_at="2026-08-17T00:00:00Z",
@@ -520,7 +533,24 @@ class TopProductSalesTests(unittest.TestCase):
         self.assertEqual(payload["updated_at"], "2026-08-17T00:00:00Z")
         self.assertEqual(
             payload["products"],
-            [{"product_id": "123", "sales": 125000.5, "rank": 1}],
+            [
+                {
+                    "product_id": "123",
+                    "product_title": "Build Your Own Small Box",
+                    "sales": 125000.5,
+                    "rank": 1,
+                    "source_rows": [
+                        {
+                            "product_id": "123",
+                            "product_title": "Build Your Own Small Box",
+                            "product_variant_id": "456",
+                            "product_variant_title": "Default Title",
+                            "product_variant_sku": "PCB30ML",
+                            "gross_sales": 125000.5,
+                        }
+                    ],
+                }
+            ],
         )
 
     def test_cache_top_product_sales_writes_ttl(self):
@@ -583,8 +613,10 @@ class TopProductSalesTests(unittest.TestCase):
                         [
                             pipeline.TopProductSalesRecord(
                                 product_id=123,
+                                product_title="Test Product",
                                 sales=Decimal("99.00"),
                                 rank=1,
+                                source_rows=(),
                             )
                         ],
                     ),
@@ -613,7 +645,15 @@ class TopProductSalesTests(unittest.TestCase):
                 raise RuntimeError("shopify failed")
             return (
                 "2026-08-16",
-                [pipeline.TopProductSalesRecord(product_id=555, sales=Decimal("10.00"), rank=1)],
+                [
+                    pipeline.TopProductSalesRecord(
+                        product_id=555,
+                        product_title="B Product",
+                        sales=Decimal("10.00"),
+                        rank=1,
+                        source_rows=(),
+                    )
+                ],
             )
 
         with mock.patch.object(
@@ -662,7 +702,15 @@ class TopProductSalesTests(unittest.TestCase):
                     "fetch_top_product_sales_for_brand",
                     return_value=(
                         "2026-08-16",
-                        [pipeline.TopProductSalesRecord(product_id=1, sales=Decimal("5.00"), rank=1)],
+                        [
+                            pipeline.TopProductSalesRecord(
+                                product_id=1,
+                                product_title="Test Product",
+                                sales=Decimal("5.00"),
+                                rank=1,
+                                source_rows=(),
+                            )
+                        ],
                     ),
                 ):
                     with mock.patch.object(
