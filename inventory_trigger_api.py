@@ -1596,6 +1596,12 @@ def ingestion_worker(stop_event: threading.Event) -> None:
         BATCH_SIZE,
     )
 
+    try:
+        run_ingestion_cycle(redis_client, reason="startup")
+        next_scheduled_run_at = time.time() + max(1, SCHEDULED_WINDOW_MINUTES * 60)
+    except Exception as exc:
+        logger.exception("%s ingestionWorker startup run failed: %s", log_prefix(), exc)
+
     while not stop_event.is_set():
         try:
             flagged = str(redis_client.get(READY_FLAG_KEY) or "").strip() == "1"
