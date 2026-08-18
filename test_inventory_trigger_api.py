@@ -736,5 +736,233 @@ class TopProductSalesTests(unittest.TestCase):
         self.assertEqual(counts["failed"], 1)
 
 
+class CacheWorkerTests(unittest.TestCase):
+    def test_build_inventory_cache_key_uses_shop_slug(self):
+        self.assertEqual(
+            pipeline.build_inventory_cache_key("ajmal-perfumes-india"),
+            "Inventory_cache:ajmal-perfumes-india",
+        )
+        self.assertEqual(
+            pipeline.build_inventory_cache_key("ajmal-perfumes-india.myshopify.com"),
+            "Inventory_cache:ajmal-perfumes-india",
+        )
+
+    def test_build_inventory_cache_payload_contains_metadata_and_all_columns(self):
+        brand = _make_brand(shop_name="ajmal-perfumes-india")
+        payload = pipeline.build_inventory_cache_payload(
+            brand,
+            [
+                {
+                    "product_id": 1,
+                    "product_title": "Product",
+                    "variant_id": 2,
+                    "variant_title": "Default Title",
+                    "sku": "SKU-1",
+                    "inventory_available": 10,
+                    "sold_units_7d": 7,
+                    "sold_units_30d": 0,
+                    "sold_units_90d": 0,
+                    "drr_7d": 1.0,
+                    "drr_30d": 0.0,
+                    "drr_90d": 0.0,
+                    "doh_7d": 10.0,
+                    "doh_30d": 0.0,
+                    "doh_90d": 0.0,
+                    "updated_at": "2026-08-18 08:11:36",
+                }
+            ],
+            cached_at="2026-08-18T08:30:00Z",
+        )
+        self.assertEqual(payload["shop"], "ajmal-perfumes-india")
+        self.assertEqual(payload["cached_at"], "2026-08-18T08:30:00Z")
+        self.assertEqual(payload["row_count"], 1)
+        self.assertEqual(
+            payload["items"][0],
+            {
+                "product_id": 1,
+                "product_title": "Product",
+                "variant_id": 2,
+                "variant_title": "Default Title",
+                "sku": "SKU-1",
+                "inventory_available": 10,
+                "sold_units_7d": 7,
+                "sold_units_30d": 0,
+                "sold_units_90d": 0,
+                "drr_7d": 1.0,
+                "drr_30d": 0.0,
+                "drr_90d": 0.0,
+                "doh_7d": 10.0,
+                "doh_30d": 0.0,
+                "doh_90d": 0.0,
+                "updated_at": "2026-08-18 08:11:36",
+            },
+        )
+
+    def test_cache_top_products_inventory_snapshot_writes_without_ttl(self):
+        redis_client = mock.Mock()
+        brand = _make_brand(shop_name="ajmal-perfumes-india")
+        payload = {"shop": "ajmal-perfumes-india", "cached_at": "x", "row_count": 0, "items": []}
+        key = pipeline.cache_top_products_inventory_snapshot(redis_client, brand, payload)
+        self.assertEqual(key, "Inventory_cache:ajmal-perfumes-india")
+        redis_client.set.assert_called_once()
+        args, kwargs = redis_client.set.call_args
+        self.assertEqual(args[0], key)
+        self.assertEqual(kwargs, {})
+
+    def test_fetch_top_products_inventory_rows_serializes_db_values(self):
+        brand = _make_brand()
+        rows = [
+            {
+                "product_id": 1,
+                "product_title": "Product",
+                "variant_id": 2,
+                "variant_title": "Default Title",
+                "sku": "SKU-1",
+                "inventory_available": 10,
+                "sold_units_7d": 7,
+                "sold_units_30d": 0,
+                "sold_units_90d": 0,
+                "drr_7d": Decimal("1.23"),
+                "drr_30d": Decimal("0.00"),
+                "drr_90d": Decimal("0.00"),
+                "doh_7d": Decimal("8.13"),
+                "doh_30d": Decimal("0.00"),
+                "doh_90d": Decimal("0.00"),
+                "updated_at": datetime(2026, 8, 18, 8, 11, 36),
+            }
+        ]
+
+        class DummyCursor:
+            def __init__(self):
+                self.executed_sql = None
+
+            def execute(self, sql):
+                self.executed_sql = sql
+
+            def fetchall(self):
+                return rows
+
+        dummy_cursor = DummyCursor()
+
+        class DummyCtx:
+            def __enter__(self):
+                return (brand, dummy_cursor, None)
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with mock.patch.object(pipeline, "get_db_cursor", return_value=DummyCtx()):
+            result = pipeline.fetch_top_products_inventory_rows(brand)
+
+        self.assertIn("ORDER BY", dummy_cursor.executed_sql)
+        self.assertIn("updated_at DESC", dummy_cursor.executed_sql)
+        self.assertEqual(
+            result,
+            [
+                {
+                    "product_id": 1,
+                    "product_title": "Product",
+                    "variant_id": 2,
+                    "variant_title": "Default Title",
+                    "sku": "SKU-1",
+                    "inventory_available": 10,
+                    "sold_units_7d": 7,
+                    "sold_units_30d": 0,
+                    "sold_units_90d": 0,
+                    "drr_7d": 1.23,
+                    "drr_30d": 0.0,
+                    "drr_90d": 0.0,
+                    "doh_7d": 8.13,
+                    "doh_30d": 0.0,
+                    "doh_90d": 0.0,
+                    "updated_at": "2026-08-18 08:11:36",
+                }
+            ],
+        )
+
+    def test_run_cache_cycle_caches_empty_snapshot_for_active_brand(self):
+        redis_client = mock.Mock()
+        brand = _make_brand(shop_name="ajmal-perfumes-india")
+        with mock.patch.object(pipeline, "get_active_brands", return_value=[brand]):
+            with mock.patch.object(
+                pipeline,
+                "fetch_top_products_inventory_rows",
+                return_value=[],
+            ):
+                with mock.patch.object(
+                    pipeline,
+                    "cache_top_products_inventory_snapshot",
+                    return_value="Inventory_cache:ajmal-perfumes-india",
+                ) as cache_mock:
+                    counts = pipeline.run_cache_cycle(redis_client)
+        self.assertEqual(counts, {"brands": 1, "cached": 1, "failed": 0})
+        payload = cache_mock.call_args.args[2]
+        self.assertEqual(payload["row_count"], 0)
+        self.assertEqual(payload["items"], [])
+
+    def test_run_cache_cycle_continues_when_one_brand_fails(self):
+        redis_client = mock.Mock()
+        brand_a = _make_brand(brand_id=1, brand_name="A", shop_name="a")
+        brand_b = _make_brand(brand_id=2, brand_name="B", shop_name="b")
+
+        def fetch_side_effect(brand):
+            if brand.brand_id == 1:
+                raise RuntimeError("db failed")
+            return []
+
+        with mock.patch.object(pipeline, "get_active_brands", return_value=[brand_a, brand_b]):
+            with mock.patch.object(
+                pipeline,
+                "fetch_top_products_inventory_rows",
+                side_effect=fetch_side_effect,
+            ):
+                with mock.patch.object(
+                    pipeline,
+                    "cache_top_products_inventory_snapshot",
+                    return_value="Inventory_cache:b",
+                ) as cache_mock:
+                    counts = pipeline.run_cache_cycle(redis_client)
+        self.assertEqual(counts["brands"], 2)
+        self.assertEqual(counts["cached"], 1)
+        self.assertEqual(counts["failed"], 1)
+        self.assertEqual(cache_mock.call_count, 1)
+
+    def test_run_cache_cycle_continues_when_one_redis_write_fails(self):
+        redis_client = mock.Mock()
+        brand_a = _make_brand(brand_id=1, brand_name="A", shop_name="a")
+        brand_b = _make_brand(brand_id=2, brand_name="B", shop_name="b")
+
+        with mock.patch.object(pipeline, "get_active_brands", return_value=[brand_a, brand_b]):
+            with mock.patch.object(
+                pipeline,
+                "fetch_top_products_inventory_rows",
+                return_value=[],
+            ):
+                def cache_side_effect(_redis, brand, _payload):
+                    if brand.brand_id == 1:
+                        raise RuntimeError("redis failed")
+                    return "Inventory_cache:b"
+
+                with mock.patch.object(
+                    pipeline,
+                    "cache_top_products_inventory_snapshot",
+                    side_effect=cache_side_effect,
+                ):
+                    counts = pipeline.run_cache_cycle(redis_client)
+        self.assertEqual(counts["brands"], 2)
+        self.assertEqual(counts["cached"], 1)
+        self.assertEqual(counts["failed"], 1)
+
+    def test_cache_worker_runs_once_on_startup(self):
+        stop_event = mock.Mock()
+        stop_event.is_set.side_effect = [False, True]
+        stop_event.wait.return_value = True
+        redis_client = mock.Mock()
+        with mock.patch.object(pipeline, "get_redis_client", return_value=redis_client):
+            with mock.patch.object(pipeline, "run_cache_cycle") as run_mock:
+                pipeline.cache_worker(stop_event)
+        run_mock.assert_called_once_with(redis_client)
+
+
 if __name__ == "__main__":
     unittest.main()

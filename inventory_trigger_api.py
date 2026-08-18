@@ -75,12 +75,16 @@ CALCULATION_BATCH_MAX_ITEMS = int(
     os.environ.get("CALCULATION_BATCH_MAX_ITEMS", "100")
 )
 CALCULATE_30D = _is_truthy_env(os.environ.get("30DAYS_CALC"))
+CACHE_WORKER_INTERVAL_MINUTES = int(
+    os.environ.get("CACHE_WORKER_INTERVAL", "30")
+)
 
 SOURCE_KEY_PREFIX = os.environ.get("INVENTORY_SOURCE_PREFIX", "product_inventory")
 READY_KEY_PREFIX = os.environ.get("INVENTORY_READY_PREFIX", "inventory_calc_ready")
 READY_FLAG_KEY = os.environ.get("INVENTORY_READY_FLAG_KEY", "inventory_ingestion_ready")
 READY_COUNT_KEY = os.environ.get("INVENTORY_READY_COUNT_KEY", "inventory_calc_ready_count")
 DEFAULT_SHOPIFY_API_VERSION = "2025-10"
+INVENTORY_CACHE_KEY_PREFIX = "Inventory_cache"
 
 _pool_lock = threading.Lock()
 _db_pools: Dict[int, Dict[str, Any]] = {}
@@ -851,6 +855,141 @@ def get_active_brands() -> List[BrandContext]:
     for brand in cache.values():
         unique_by_brand_id[brand.brand_id] = brand
     return [unique_by_brand_id[key] for key in sorted(unique_by_brand_id)]
+
+
+def build_inventory_cache_key(shop_name: str) -> str:
+    return f"{INVENTORY_CACHE_KEY_PREFIX}:{normalize_shop_name(shop_name)}"
+
+
+def _serialize_inventory_cache_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return value
+
+
+def fetch_top_products_inventory_rows(brand: BrandContext) -> List[Dict[str, Any]]:
+    with get_db_cursor(brand.brand_id) as (_, cursor, _connection):
+        cursor.execute(
+            """
+            SELECT
+                product_id,
+                product_title,
+                variant_id,
+                variant_title,
+                sku,
+                inventory_available,
+                sold_units_7d,
+                sold_units_30d,
+                sold_units_90d,
+                drr_7d,
+                drr_30d,
+                drr_90d,
+                doh_7d,
+                doh_30d,
+                doh_90d,
+                updated_at
+            FROM top_products_inventory
+            ORDER BY
+                updated_at DESC,
+                product_id ASC,
+                variant_id ASC
+            """
+        )
+        rows = cursor.fetchall() or []
+
+    serialized_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        serialized_rows.append(
+            {
+                "product_id": _serialize_inventory_cache_value(row.get("product_id")),
+                "product_title": _serialize_inventory_cache_value(row.get("product_title")),
+                "variant_id": _serialize_inventory_cache_value(row.get("variant_id")),
+                "variant_title": _serialize_inventory_cache_value(row.get("variant_title")),
+                "sku": _serialize_inventory_cache_value(row.get("sku")),
+                "inventory_available": _serialize_inventory_cache_value(
+                    row.get("inventory_available")
+                ),
+                "sold_units_7d": _serialize_inventory_cache_value(row.get("sold_units_7d")),
+                "sold_units_30d": _serialize_inventory_cache_value(row.get("sold_units_30d")),
+                "sold_units_90d": _serialize_inventory_cache_value(row.get("sold_units_90d")),
+                "drr_7d": _serialize_inventory_cache_value(row.get("drr_7d")),
+                "drr_30d": _serialize_inventory_cache_value(row.get("drr_30d")),
+                "drr_90d": _serialize_inventory_cache_value(row.get("drr_90d")),
+                "doh_7d": _serialize_inventory_cache_value(row.get("doh_7d")),
+                "doh_30d": _serialize_inventory_cache_value(row.get("doh_30d")),
+                "doh_90d": _serialize_inventory_cache_value(row.get("doh_90d")),
+                "updated_at": _serialize_inventory_cache_value(row.get("updated_at")),
+            }
+        )
+    return serialized_rows
+
+
+def build_inventory_cache_payload(
+    brand: BrandContext,
+    rows: Sequence[Dict[str, Any]],
+    cached_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "shop": normalize_shop_name(brand.shop_name),
+        "cached_at": cached_at
+        or datetime.now(ZoneInfo("UTC")).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "row_count": len(rows),
+        "items": list(rows),
+    }
+
+
+def cache_top_products_inventory_snapshot(
+    redis_client: redis.Redis,
+    brand: BrandContext,
+    payload: Dict[str, Any],
+) -> str:
+    key = build_inventory_cache_key(brand.shop_name)
+    redis_client.set(key, json.dumps(payload, separators=(",", ":")))
+    return key
+
+
+def run_cache_cycle(redis_client: redis.Redis) -> Dict[str, int]:
+    brands = get_active_brands()
+    if not brands:
+        logger.info("%s Cache worker found no active brands.", log_prefix())
+        return {"brands": 0, "cached": 0, "failed": 0}
+
+    cached_count = 0
+    failed_count = 0
+    for brand in brands:
+        try:
+            logger.info(
+                "%s Cache worker refreshing top_products_inventory snapshot.",
+                log_prefix(brand),
+            )
+            rows = fetch_top_products_inventory_rows(brand)
+            logger.info(
+                "%s Cache worker fetched %s rows from top_products_inventory.",
+                log_prefix(brand),
+                len(rows),
+            )
+            payload = build_inventory_cache_payload(brand, rows)
+            key = cache_top_products_inventory_snapshot(redis_client, brand, payload)
+            cached_count += 1
+            logger.info(
+                "%s Cache worker stored snapshot in %s.",
+                log_prefix(brand),
+                key,
+            )
+        except Exception as exc:
+            failed_count += 1
+            logger.exception("%s Cache worker failed: %s", log_prefix(brand), exc)
+
+    logger.info(
+        "%s Cache cycle complete. brands=%s cached=%s failed=%s",
+        log_prefix(),
+        len(brands),
+        cached_count,
+        failed_count,
+    )
+    return {"brands": len(brands), "cached": cached_count, "failed": failed_count}
 
 
 TOP_PRODUCT_SALES_SERVICE = TopProductSalesService(
@@ -1624,6 +1763,28 @@ def top_product_sales_worker(stop_event: threading.Event) -> None:
     TOP_PRODUCT_SALES_SERVICE.top_product_sales_worker(stop_event)
 
 
+def cache_worker(stop_event: threading.Event) -> None:
+    redis_client = get_redis_client()
+    logger.info(
+        "%s cacheWorker started. interval=%s minutes",
+        log_prefix(),
+        CACHE_WORKER_INTERVAL_MINUTES,
+    )
+
+    try:
+        run_cache_cycle(redis_client)
+    except Exception as exc:
+        logger.exception("%s cacheWorker startup run failed: %s", log_prefix(), exc)
+
+    while not stop_event.is_set():
+        if stop_event.wait(max(1, CACHE_WORKER_INTERVAL_MINUTES * 60)):
+            break
+        try:
+            run_cache_cycle(redis_client)
+        except Exception as exc:
+            logger.exception("%s cacheWorker failed: %s", log_prefix(), exc)
+
+
 def send_lifecycle_event(run_id: str, status: str) -> None:
     if status == "running":
         manager_endpoint = os.environ.get("MANAGER_STARTED_ENDPOINT", "").strip()
@@ -1769,6 +1930,7 @@ def main() -> None:
     workers = [
         threading.Thread(target=calculation_worker, args=(stop_event,), daemon=True),
         threading.Thread(target=top_product_sales_worker, args=(stop_event,), daemon=True),
+        threading.Thread(target=cache_worker, args=(stop_event,), daemon=True),
     ]
 
     # Calculation worker always runs. SELF_RUN controls only ingestion scheduling.
