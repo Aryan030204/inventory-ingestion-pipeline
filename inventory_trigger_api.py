@@ -93,6 +93,7 @@ _brand_context_by_shop_domain: Dict[str, "BrandContext"] = {}
 _brand_cache_loaded_at = 0.0
 _pending_batches_lock = threading.Lock()
 _pending_batches_by_domain: Dict[str, "PendingCalculationBatch"] = {}
+_ingestion_run_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -1725,6 +1726,23 @@ def calculation_worker(stop_event: threading.Event) -> None:
         stop_event.wait(sleep_for)
 
 
+def run_ingestion_cycle_exclusive(redis_client: redis.Redis, reason: str) -> Optional[Dict[str, int]]:
+    """Runs run_ingestion_cycle only if no other ingestion cycle (scheduled or
+    manual-trigger) is currently in flight, so concurrent runs don't pile up
+    DB connections for the same brand pools. Returns None if skipped."""
+    if not _ingestion_run_lock.acquire(blocking=False):
+        logger.info(
+            "%s Ingestion cycle (%s) skipped; another cycle is already running.",
+            log_prefix(),
+            reason,
+        )
+        return None
+    try:
+        return run_ingestion_cycle(redis_client, reason=reason)
+    finally:
+        _ingestion_run_lock.release()
+
+
 def ingestion_worker(stop_event: threading.Event) -> None:
     redis_client = get_redis_client()
     next_scheduled_run_at = time.time() + max(1, SCHEDULED_WINDOW_MINUTES * 60)
@@ -1736,7 +1754,7 @@ def ingestion_worker(stop_event: threading.Event) -> None:
     )
 
     try:
-        run_ingestion_cycle(redis_client, reason="startup")
+        run_ingestion_cycle_exclusive(redis_client, reason="startup")
         next_scheduled_run_at = time.time() + max(1, SCHEDULED_WINDOW_MINUTES * 60)
     except Exception as exc:
         logger.exception("%s ingestionWorker startup run failed: %s", log_prefix(), exc)
@@ -1748,10 +1766,10 @@ def ingestion_worker(stop_event: threading.Event) -> None:
             scheduled_due = now_ts >= next_scheduled_run_at
 
             if flagged:
-                run_ingestion_cycle(redis_client, reason="batch-threshold")
+                run_ingestion_cycle_exclusive(redis_client, reason="batch-threshold")
                 next_scheduled_run_at = time.time() + max(1, SCHEDULED_WINDOW_MINUTES * 60)
             elif scheduled_due:
-                run_ingestion_cycle(redis_client, reason="scheduled-window")
+                run_ingestion_cycle_exclusive(redis_client, reason="scheduled-window")
                 next_scheduled_run_at = time.time() + max(1, SCHEDULED_WINDOW_MINUTES * 60)
         except Exception as exc:
             logger.exception("%s ingestionWorker failed: %s", log_prefix(), exc)
@@ -1877,7 +1895,11 @@ def run_manual_trigger(run_id: str):
     send_lifecycle_event(run_id, "running")
     try:
         redis_client = get_redis_client()
-        run_ingestion_cycle(redis_client, reason="manual-trigger")
+        result = run_ingestion_cycle_exclusive(redis_client, reason="manual-trigger")
+        if result is None:
+            raise RuntimeError(
+                "Another ingestion cycle is already running; manual trigger skipped."
+            )
         logger.info("%s Manual ingestion trigger completed successfully.", log_prefix())
         success = True
     except Exception as exc:
