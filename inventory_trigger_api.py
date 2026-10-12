@@ -94,6 +94,8 @@ _brand_cache_loaded_at = 0.0
 _pending_batches_lock = threading.Lock()
 _pending_batches_by_domain: Dict[str, "PendingCalculationBatch"] = {}
 _ingestion_run_lock = threading.Lock()
+_redis_client_lock = threading.Lock()
+_redis_client: Optional[redis.Redis] = None
 
 
 @dataclass(frozen=True)
@@ -543,12 +545,21 @@ def get_db_cursor(brand_id: int):
 
 
 def get_redis_client() -> redis.Redis:
+    global _redis_client
+
+    if _redis_client is not None:
+        return _redis_client
+
     if not REDIS_URI:
         raise RuntimeError("REDIS_URI is not configured.")
-    redis_uri = REDIS_URI
-    if "://" not in redis_uri:
-        redis_uri = f"redis://{redis_uri}"
-    return redis.Redis.from_url(redis_uri, decode_responses=True)
+
+    with _redis_client_lock:
+        if _redis_client is None:
+            redis_uri = REDIS_URI
+            if "://" not in redis_uri:
+                redis_uri = f"redis://{redis_uri}"
+            _redis_client = redis.Redis.from_url(redis_uri, decode_responses=True)
+        return _redis_client
 
 
 def quantize(value: Decimal, places: str = "0.01") -> Decimal:
@@ -1943,7 +1954,24 @@ def validate_environment() -> None:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
 
-def main() -> None:
+_background_workers_lock = threading.Lock()
+_background_workers_started = False
+
+
+def start_background_workers() -> None:
+    """Starts the calculation/ingestion/cache/top-product-sales worker threads.
+
+    Idempotent: safe to call multiple times (e.g. once per gunicorn worker
+    process via post_fork) without starting duplicate threads within the
+    same process.
+    """
+    global _background_workers_started
+
+    with _background_workers_lock:
+        if _background_workers_started:
+            return
+        _background_workers_started = True
+
     validate_environment()
     load_brand_context_cache(force=True)
 
@@ -1975,16 +2003,11 @@ def main() -> None:
             log_prefix(),
         )
 
-    try:
-        # Start Flask server
-        port = int(os.environ.get("PORT", 8050))
-        app.run(host="0.0.0.0", port=port)
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("%s Shutdown signal received.", log_prefix())
-        stop_event.set()
-        for worker in workers:
-            worker.join(timeout=5)
-        logger.info("%s Inventory Redis worker service stopped.", log_prefix())
+
+def main() -> None:
+    start_background_workers()
+    port = int(os.environ.get("PORT", 8050))
+    app.run(host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
