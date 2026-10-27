@@ -75,6 +75,20 @@ CALCULATION_BATCH_MAX_ITEMS = int(
     os.environ.get("CALCULATION_BATCH_MAX_ITEMS", "100")
 )
 CALCULATE_30D = _is_truthy_env(os.environ.get("30DAYS_CALC"))
+# The ingestion, cache and top-product-sales workers each run a cycle when the process starts. They wait
+# this long first (plus a fixed extra offset per worker) so a host/container restart does not start
+# every pipeline's heavy work at the same moment. Recurring schedules are unchanged.
+INVENTORY_STARTUP_DELAY_S = max(0, int(os.environ.get("INVENTORY_STARTUP_DELAY_S", "150") or 0))
+INGESTION_STARTUP_OFFSET_S = 0
+CACHE_STARTUP_OFFSET_S = 60
+TOP_PRODUCT_SALES_STARTUP_OFFSET_S = 120
+
+
+def _wait_for_startup_slot(stop_event: threading.Event, offset_s: int = 0) -> bool:
+    """Waits out this worker's startup slot. Returns True if the process is stopping meanwhile."""
+    return stop_event.wait(INVENTORY_STARTUP_DELAY_S + offset_s)
+
+
 CACHE_WORKER_INTERVAL_MINUTES = int(
     os.environ.get("CACHE_WORKER_INTERVAL", "30")
 )
@@ -1764,6 +1778,8 @@ def ingestion_worker(stop_event: threading.Event) -> None:
         BATCH_SIZE,
     )
 
+    if _wait_for_startup_slot(stop_event, INGESTION_STARTUP_OFFSET_S):
+        return
     try:
         run_ingestion_cycle_exclusive(redis_client, reason="startup")
         next_scheduled_run_at = time.time() + max(1, SCHEDULED_WINDOW_MINUTES * 60)
@@ -1800,6 +1816,8 @@ def cache_worker(stop_event: threading.Event) -> None:
         CACHE_WORKER_INTERVAL_MINUTES,
     )
 
+    if _wait_for_startup_slot(stop_event, CACHE_STARTUP_OFFSET_S):
+        return
     try:
         run_cache_cycle(redis_client)
     except Exception as exc:

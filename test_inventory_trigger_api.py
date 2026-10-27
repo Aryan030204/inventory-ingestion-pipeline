@@ -359,14 +359,62 @@ class TopProductSalesTests(unittest.TestCase):
         )
         self.assertIn("LIMIT 1000 OFFSET 1000", query)
 
-    def test_next_top_product_sales_run_is_next_midnight_ist(self):
+    def test_next_top_product_sales_run_is_0023_ist(self):
+        # 06:30 UTC = 12:00 IST on the 17th -> the next run is 00:23 IST on the 18th (was 00:00).
         next_run = pipeline.get_next_top_product_sales_run_at(
             datetime(2026, 8, 17, 6, 30, tzinfo=timezone.utc)
         )
         self.assertEqual(
             next_run.astimezone(pipeline.TOP_PRODUCT_SALES_SCHEDULE_TIMEZONE).isoformat(),
-            "2026-08-18T00:00:00+05:30",
+            "2026-08-18T00:23:00+05:30",
         )
+
+    def test_next_top_product_sales_run_just_after_midnight_is_the_same_night(self):
+        # 18:40 UTC = 00:10 IST on the 18th, before 00:23 -> still due tonight, not a day later.
+        next_run = pipeline.get_next_top_product_sales_run_at(
+            datetime(2026, 8, 17, 18, 40, tzinfo=timezone.utc)
+        )
+        self.assertEqual(
+            next_run.astimezone(pipeline.TOP_PRODUCT_SALES_SCHEDULE_TIMEZONE).isoformat(),
+            "2026-08-18T00:23:00+05:30",
+        )
+
+    def test_next_top_product_sales_run_after_the_run_is_tomorrow(self):
+        # 18:55 UTC = 00:25 IST on the 18th, after 00:23 -> the 19th.
+        next_run = pipeline.get_next_top_product_sales_run_at(
+            datetime(2026, 8, 17, 18, 55, tzinfo=timezone.utc)
+        )
+        self.assertEqual(
+            next_run.astimezone(pipeline.TOP_PRODUCT_SALES_SCHEDULE_TIMEZONE).isoformat(),
+            "2026-08-19T00:23:00+05:30",
+        )
+
+    def test_startup_cycles_wait_for_their_slot_before_running(self):
+        import threading
+        from unittest import mock
+
+        stop = threading.Event()
+        with mock.patch.object(pipeline, "INVENTORY_STARTUP_DELAY_S", 150), \
+             mock.patch.object(stop, "wait", return_value=True) as wait:
+            self.assertTrue(pipeline._wait_for_startup_slot(stop, pipeline.CACHE_STARTUP_OFFSET_S))
+        wait.assert_called_once_with(210)
+        offsets = {pipeline.INGESTION_STARTUP_OFFSET_S, pipeline.CACHE_STARTUP_OFFSET_S,
+                   pipeline.TOP_PRODUCT_SALES_STARTUP_OFFSET_S}
+        self.assertEqual(len(offsets), 3, "the three startup cycles must not share a slot")
+
+    def test_workers_do_not_run_a_cycle_when_stopped_during_the_startup_wait(self):
+        import threading
+        from unittest import mock
+
+        stop = threading.Event()
+        stop.set()
+        with mock.patch.object(pipeline, "get_redis_client", return_value=mock.Mock()), \
+             mock.patch.object(pipeline, "run_ingestion_cycle_exclusive") as ingestion, \
+             mock.patch.object(pipeline, "run_cache_cycle") as cache:
+            pipeline.ingestion_worker(stop)
+            pipeline.cache_worker(stop)
+        ingestion.assert_not_called()
+        cache.assert_not_called()
 
     def test_format_shopifyql_table_parses_object_rows(self):
         rows = pipeline._format_shopifyql_table(
@@ -956,7 +1004,8 @@ class CacheWorkerTests(unittest.TestCase):
     def test_cache_worker_runs_once_on_startup(self):
         stop_event = mock.Mock()
         stop_event.is_set.side_effect = [False, True]
-        stop_event.wait.return_value = True
+        # first wait = the startup slot (not stopped), second = the interval wait (stopped)
+        stop_event.wait.side_effect = [False, True]
         redis_client = mock.Mock()
         with mock.patch.object(pipeline, "get_redis_client", return_value=redis_client):
             with mock.patch.object(pipeline, "run_cache_cycle") as run_mock:

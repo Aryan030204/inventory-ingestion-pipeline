@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -17,6 +18,12 @@ DEFAULT_SHOPIFY_API_VERSION = "2025-10"
 DEFAULT_STORE_TIMEZONE = "Asia/Kolkata"
 TOP_PRODUCT_SALES_SCHEDULE_TIMEZONE = ZoneInfo("Asia/Kolkata")
 TOP_PRODUCT_SALES_PAGE_SIZE = 1000
+# Daily run at 00:23 IST instead of 00:00, off the ETL tick and the other midnight jobs. The cycle only needs
+# the day to have rolled over, so the offset changes nothing for the cached data.
+TOP_PRODUCT_SALES_RUN_OFFSET_MINUTES = 23
+# The startup cycle waits this long (INVENTORY_STARTUP_DELAY_S + 120 s) so a restart does not start every
+# worker at once. The cycle skips brands already cached for today, so a late start loses nothing.
+TOP_PRODUCT_SALES_STARTUP_OFFSET_S = 120
 
 
 @dataclass(frozen=True)
@@ -157,12 +164,12 @@ class TopProductSalesService:
     ) -> datetime:
         now_dt = self.normalize_utc_datetime(now_utc)
         ist_now = now_dt.astimezone(TOP_PRODUCT_SALES_SCHEDULE_TIMEZONE)
-        next_midnight_ist = datetime.combine(
-            ist_now.date() + timedelta(days=1),
-            datetime.min.time(),
-            tzinfo=TOP_PRODUCT_SALES_SCHEDULE_TIMEZONE,
-        )
-        return next_midnight_ist.astimezone(ZoneInfo("UTC"))
+        run_offset = timedelta(minutes=TOP_PRODUCT_SALES_RUN_OFFSET_MINUTES)
+        run_today = datetime.combine(
+            ist_now.date(), datetime.min.time(), tzinfo=TOP_PRODUCT_SALES_SCHEDULE_TIMEZONE
+        ) + run_offset
+        next_run = run_today if ist_now < run_today else run_today + timedelta(days=1)
+        return next_run.astimezone(ZoneInfo("UTC"))
 
     def build_top_product_sales_shopifyql(
         self,
@@ -550,6 +557,9 @@ VISUALIZE gross_sales TYPE table
             TOP_PRODUCT_SALES_CACHE_TTL_SECONDS,
         )
 
+        startup_delay = max(0, int(os.environ.get("INVENTORY_STARTUP_DELAY_S", "150") or 0))
+        if stop_event.wait(startup_delay + TOP_PRODUCT_SALES_STARTUP_OFFSET_S):
+            return
         try:
             self.run_top_product_sales_cycle(redis_client)
         except Exception as exc:

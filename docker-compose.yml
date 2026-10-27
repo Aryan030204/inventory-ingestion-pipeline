@@ -11,8 +11,23 @@ services:
     env_file:
       - .env
       - .env.local
+    environment:
+      # Startup cycles (ingestion, cache, top-product sales) wait this long, so a restart does not
+      # start every pipeline's work at once. The recurring schedule is unchanged.
+      INVENTORY_STARTUP_DELAY_S: ${INVENTORY_STARTUP_DELAY_S:-150}
     ports:
       - "8050:8050"
     restart: unless-stopped
+    # Resource isolation for the shared 4 GiB host: no swap spill (memswap_limit == mem_limit),
+    # a CPU ceiling and a PID cap.
+    mem_limit: ${INVENTORY_PIPELINE_MEM_LIMIT:-768m}
+    memswap_limit: ${INVENTORY_PIPELINE_MEM_LIMIT:-768m}
+    cpus: ${INVENTORY_PIPELINE_CPUS:-1.0}
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - pipeline-net
