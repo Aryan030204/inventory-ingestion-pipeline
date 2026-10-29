@@ -1428,9 +1428,58 @@ def bulk_fetch_sold_units(
     return sold_units_by_variant
 
 
+def update_oos_history(
+    cursor, source_items: Sequence[SourceInventoryItem], detected_at: datetime
+) -> None:
+    """Records observed out-of-stock transitions for changed inventory items.
+
+    Idempotent: running the same source_items batch twice is a no-op the second
+    time. See inventory_oos_history schema for the uniqueness/idempotency
+    guarantees this relies on.
+    """
+    restock_params: List[Tuple[datetime, int, int]] = []
+    oos_params: List[Tuple[int, int, datetime, int, int]] = []
+
+    for item in source_items:
+        variant_key = _variant_sales_key(item.product_id, item.variant_id)
+        if variant_key is None:
+            continue
+        product_id, variant_id = variant_key
+
+        if item.inventory_quantity > 0:
+            restock_params.append((detected_at, product_id, variant_id))
+        else:
+            oos_params.append((product_id, variant_id, detected_at, product_id, variant_id))
+
+    if restock_params:
+        cursor.executemany(
+            """
+            UPDATE inventory_oos_history
+            SET back_in_stock_at = %s
+            WHERE product_id = %s AND variant_id = %s AND back_in_stock_at IS NULL
+            """,
+            restock_params,
+        )
+
+    if oos_params:
+        cursor.executemany(
+            """
+            INSERT INTO inventory_oos_history (product_id, variant_id, out_of_stock_at)
+            SELECT %s, %s, %s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM inventory_oos_history
+                WHERE product_id = %s AND variant_id = %s AND back_in_stock_at IS NULL
+            )
+            """,
+            oos_params,
+        )
+
+
 def calculate_domain_items(
     brand: BrandContext, source_items: Sequence[SourceInventoryItem]
 ) -> List[CalculatedInventoryItem]:
+    detected_at = datetime.utcnow()
+
     variant_pairs: List[Tuple[int, int]] = []
     for item in source_items:
         variant_key = _variant_sales_key(item.product_id, item.variant_id)
@@ -1445,8 +1494,10 @@ def calculate_domain_items(
         variant_pairs.append(variant_key)
 
     unique_variant_pairs = sorted(set(variant_pairs))
-    with get_db_cursor(brand.brand_id) as (_, cursor, _connection):
+    with get_db_cursor(brand.brand_id) as (_, cursor, connection):
         sold_units_by_variant = bulk_fetch_sold_units(cursor, unique_variant_pairs)
+        update_oos_history(cursor, source_items, detected_at)
+        connection.commit()
 
     calculated_items: List[CalculatedInventoryItem] = []
     for item in source_items:

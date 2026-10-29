@@ -284,19 +284,17 @@ class SoldUnitsQueryTests(unittest.TestCase):
             (111, 1002): {"sold_units_7d": 47, "sold_units_30d": 0},
         }
 
-        class DummyCursor:
-            pass
-
         class DummyCtx:
             def __enter__(self):
-                return (brand, DummyCursor(), None)
+                return (brand, mock.MagicMock(), mock.MagicMock())
 
             def __exit__(self, exc_type, exc, tb):
                 return False
 
         with mock.patch.object(pipeline, "get_db_cursor", return_value=DummyCtx()):
             with mock.patch.object(pipeline, "bulk_fetch_sold_units", return_value=fake_sales):
-                items = pipeline.calculate_domain_items(brand, source_items)
+                with mock.patch.object(pipeline, "update_oos_history"):
+                    items = pipeline.calculate_domain_items(brand, source_items)
 
         self.assertEqual(items[0].sold_units_7d, 168)
         self.assertEqual(items[1].sold_units_7d, 47)
@@ -309,12 +307,9 @@ class SoldUnitsQueryTests(unittest.TestCase):
             pipeline.SourceInventoryItem("test.myshopify.com", 111, "P", 0, "Broken", "SKU-X", 20),
         ]
 
-        class DummyCursor:
-            pass
-
         class DummyCtx:
             def __enter__(self):
-                return (brand, DummyCursor(), None)
+                return (brand, mock.MagicMock(), mock.MagicMock())
 
             def __exit__(self, exc_type, exc, tb):
                 return False
@@ -325,7 +320,8 @@ class SoldUnitsQueryTests(unittest.TestCase):
                 "bulk_fetch_sold_units",
                 return_value={(111, 1001): {"sold_units_7d": 215, "sold_units_30d": 0}},
             ):
-                items = pipeline.calculate_domain_items(brand, source_items)
+                with mock.patch.object(pipeline, "update_oos_history"):
+                    items = pipeline.calculate_domain_items(brand, source_items)
 
         self.assertEqual(items[0].sold_units_7d, 0)
         self.assertEqual(items[0].drr_7d, Decimal("0.00"))
@@ -1011,6 +1007,211 @@ class CacheWorkerTests(unittest.TestCase):
             with mock.patch.object(pipeline, "run_cache_cycle") as run_mock:
                 pipeline.cache_worker(stop_event)
         run_mock.assert_called_once_with(redis_client)
+
+
+class _SqliteOosCursor:
+    """Wraps a sqlite3 cursor so pipeline.update_oos_history's %s-style SQL
+    (written for MySQL) can run unmodified against an in-memory sqlite DB."""
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def executemany(self, sql, params_seq):
+        self._cursor.executemany(sql.replace("%s", "?"), params_seq)
+
+    def execute(self, sql, params=()):
+        self._cursor.execute(sql.replace("%s", "?"), params)
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+
+def _make_oos_cursor():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE inventory_oos_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            variant_id INTEGER NOT NULL,
+            out_of_stock_at TEXT NOT NULL,
+            back_in_stock_at TEXT NULL
+        )
+        """
+    )
+    return conn, _SqliteOosCursor(conn.cursor())
+
+
+def _open_periods(conn):
+    rows = conn.execute(
+        "SELECT product_id, variant_id, out_of_stock_at, back_in_stock_at "
+        "FROM inventory_oos_history WHERE back_in_stock_at IS NULL"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _all_periods(conn):
+    rows = conn.execute(
+        "SELECT product_id, variant_id, out_of_stock_at, back_in_stock_at "
+        "FROM inventory_oos_history ORDER BY id"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+class OosHistoryTests(unittest.TestCase):
+    def test_normal_inventory_change_creates_no_row(self):
+        conn, cursor = _make_oos_cursor()
+        items = [
+            pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1, "A", "SKU", 5),
+        ]
+        pipeline.update_oos_history(cursor, items, datetime(2026, 1, 1, 10, 0))
+        items2 = [
+            pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1, "A", "SKU", 10),
+        ]
+        pipeline.update_oos_history(cursor, items2, datetime(2026, 1, 1, 10, 30))
+        conn.commit()
+
+        self.assertEqual(_all_periods(conn), [])
+
+    def test_first_oos_transition_creates_open_row(self):
+        conn, cursor = _make_oos_cursor()
+        items = [
+            pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1, "A", "SKU", 0),
+        ]
+        pipeline.update_oos_history(cursor, items, datetime(2026, 1, 1, 11, 0))
+        conn.commit()
+
+        open_rows = _open_periods(conn)
+        self.assertEqual(len(open_rows), 1)
+        self.assertIsNone(open_rows[0]["back_in_stock_at"])
+        self.assertEqual(open_rows[0]["out_of_stock_at"], "2026-01-01 11:00:00")
+
+    def test_continued_oos_across_cycles_creates_only_one_row(self):
+        conn, cursor = _make_oos_cursor()
+        item = pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1, "A", "SKU", 0)
+        for hour in (11, 11, 12, 12):
+            pipeline.update_oos_history(cursor, [item], datetime(2026, 1, 1, hour, 30))
+        conn.commit()
+
+        self.assertEqual(len(_all_periods(conn)), 1)
+        self.assertEqual(
+            _all_periods(conn)[0]["out_of_stock_at"], "2026-01-01 11:30:00"
+        )
+
+    def test_back_in_stock_closes_open_row(self):
+        conn, cursor = _make_oos_cursor()
+        oos_item = pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1, "A", "SKU", 0)
+        restock_item = pipeline.SourceInventoryItem(
+            "test.myshopify.com", 1, "P", 1, "A", "SKU", 20
+        )
+        pipeline.update_oos_history(cursor, [oos_item], datetime(2026, 1, 1, 11, 0))
+        pipeline.update_oos_history(cursor, [restock_item], datetime(2026, 1, 1, 13, 0))
+        conn.commit()
+
+        periods = _all_periods(conn)
+        self.assertEqual(len(periods), 1)
+        self.assertEqual(periods[0]["out_of_stock_at"], "2026-01-01 11:00:00")
+        self.assertEqual(periods[0]["back_in_stock_at"], "2026-01-01 13:00:00")
+        self.assertEqual(_open_periods(conn), [])
+
+    def test_worked_example_from_spec_produces_single_period(self):
+        # 10:00=5, 10:30=2, 11:00=0, 11:30=0, 12:00=0, 12:30=0, 13:00=20
+        conn, cursor = _make_oos_cursor()
+
+        def make(qty):
+            return pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1, "A", "SKU", qty)
+
+        schedule = [
+            (10, 0, 5), (10, 30, 2), (11, 0, 0), (11, 30, 0),
+            (12, 0, 0), (12, 30, 0), (13, 0, 20),
+        ]
+        for hour, minute, qty in schedule:
+            pipeline.update_oos_history(
+                cursor, [make(qty)], datetime(2026, 1, 1, hour, minute)
+            )
+        conn.commit()
+
+        periods = _all_periods(conn)
+        self.assertEqual(len(periods), 1)
+        self.assertEqual(periods[0]["out_of_stock_at"], "2026-01-01 11:00:00")
+        self.assertEqual(periods[0]["back_in_stock_at"], "2026-01-01 13:00:00")
+
+    def test_second_independent_oos_period(self):
+        conn, cursor = _make_oos_cursor()
+
+        def make(qty):
+            return pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1, "A", "SKU", qty)
+
+        pipeline.update_oos_history(cursor, [make(0)], datetime(2026, 1, 1, 9, 0))
+        pipeline.update_oos_history(cursor, [make(20)], datetime(2026, 1, 1, 10, 0))
+        pipeline.update_oos_history(cursor, [make(0)], datetime(2026, 1, 1, 14, 0))
+        conn.commit()
+
+        periods = _all_periods(conn)
+        self.assertEqual(len(periods), 2)
+        self.assertEqual(periods[0]["back_in_stock_at"], "2026-01-01 10:00:00")
+        self.assertIsNone(periods[1]["back_in_stock_at"])
+        self.assertEqual(periods[1]["out_of_stock_at"], "2026-01-01 14:00:00")
+
+    def test_retry_with_identical_batch_is_idempotent(self):
+        conn, cursor = _make_oos_cursor()
+        item = pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1, "A", "SKU", 0)
+        detected_at = datetime(2026, 1, 1, 11, 0)
+
+        pipeline.update_oos_history(cursor, [item], detected_at)
+        # Simulate a retry of the exact same batch (e.g. after a commit failure).
+        pipeline.update_oos_history(cursor, [item], detected_at)
+        conn.commit()
+
+        self.assertEqual(len(_all_periods(conn)), 1)
+
+    def test_one_variant_oos_does_not_affect_another_variant(self):
+        conn, cursor = _make_oos_cursor()
+        items = [
+            pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1001, "A", "SKU-A", 0),
+            pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1002, "B", "SKU-B", 15),
+        ]
+        pipeline.update_oos_history(cursor, items, datetime(2026, 1, 1, 11, 0))
+        conn.commit()
+
+        open_rows = _open_periods(conn)
+        self.assertEqual(len(open_rows), 1)
+        self.assertEqual(open_rows[0]["variant_id"], 1001)
+
+    def test_invalid_identifiers_are_skipped_not_recorded(self):
+        conn, cursor = _make_oos_cursor()
+        items = [
+            pipeline.SourceInventoryItem("test.myshopify.com", 0, "Broken", 0, "Broken", "SKU", 0),
+        ]
+        pipeline.update_oos_history(cursor, items, datetime(2026, 1, 1, 11, 0))
+        conn.commit()
+
+        self.assertEqual(_all_periods(conn), [])
+
+    def test_calculate_domain_items_invokes_oos_history_update_and_commits(self):
+        brand = _make_brand()
+        source_items = [
+            pipeline.SourceInventoryItem("test.myshopify.com", 111, "P", 1001, "A", "SKU-A", 0),
+        ]
+        connection = mock.MagicMock()
+
+        class DummyCtx:
+            def __enter__(self):
+                return (brand, mock.MagicMock(), connection)
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with mock.patch.object(pipeline, "get_db_cursor", return_value=DummyCtx()):
+            with mock.patch.object(pipeline, "bulk_fetch_sold_units", return_value={}):
+                with mock.patch.object(pipeline, "update_oos_history") as oos_mock:
+                    pipeline.calculate_domain_items(brand, source_items)
+
+        oos_mock.assert_called_once()
+        called_items = oos_mock.call_args.args[1]
+        self.assertEqual(list(called_items), source_items)
+        connection.commit.assert_called_once()
 
 
 if __name__ == "__main__":
