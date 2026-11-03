@@ -134,6 +134,11 @@ class SourceInventoryItem:
     variant_title: str
     sku: Optional[str]
     inventory_quantity: int
+    # False when the source webhook doc had no inventory_quantity field at all (vs. a
+    # genuine 0) - e.g. a partial/failed sync. OOS detection must skip these rather
+    # than treat a missing value as "out of stock". DRR/DOH still default to 0 here,
+    # unchanged.
+    inventory_quantity_known: bool = True
 
 
 @dataclass(frozen=True)
@@ -603,6 +608,7 @@ def parse_source_item(raw_item: Dict[str, Any], shop_domain_hint: str) -> Source
     if not shop_domain:
         raise ValueError("shop_domain is missing.")
 
+    inventory_quantity_known = raw_item.get("inventory_quantity") is not None
     inventory_quantity = int(raw_item.get("inventory_quantity") or 0)
     return SourceInventoryItem(
         shop_domain=shop_domain,
@@ -612,6 +618,7 @@ def parse_source_item(raw_item: Dict[str, Any], shop_domain_hint: str) -> Source
         variant_title=str(raw_item.get("variant_title") or "").strip(),
         sku=(str(raw_item.get("sku")).strip() if raw_item.get("sku") is not None else None),
         inventory_quantity=max(inventory_quantity, 0),
+        inventory_quantity_known=inventory_quantity_known,
     )
 
 
@@ -1429,33 +1436,90 @@ def bulk_fetch_sold_units(
 
 
 def update_oos_history(
-    cursor, source_items: Sequence[SourceInventoryItem], detected_at: datetime
+    cursor,
+    source_items: Sequence[SourceInventoryItem],
+    detected_at: datetime,
+    brand: Optional[BrandContext] = None,
 ) -> None:
     """Records observed out-of-stock transitions for changed inventory items.
 
     Idempotent: running the same source_items batch twice is a no-op the second
     time. See inventory_oos_history schema for the uniqueness/idempotency
     guarantees this relies on.
-    """
-    restock_params: List[Tuple[datetime, int, int]] = []
-    oos_params: List[Tuple[int, int, datetime, int, int]] = []
 
+    Variant-level: this table mirrors the existing inventory signal's grain
+    (product_id, variant_id) - a "period" here is one variant's OOS episode, not a
+    whole product's. A product with several variants can have independent,
+    concurrently-open periods, one per variant.
+
+    First-observation semantics: an item observed OOS with no prior open period is
+    recorded with out_of_stock_at = detected_at (when *this pipeline* first observed
+    it OOS), never backdated - we only ever claim "observed OOS at this time", not
+    "went OOS at this time". The same caveat applies if this is genuinely the first
+    time this variant has ever been seen: there is no way to know how long it was
+    already OOS before the pipeline started watching it.
+
+    Items with inventory_quantity_known=False (source payload had no
+    inventory_quantity field at all, e.g. a partial/failed sync) are skipped
+    entirely - never treated as a 0.
+
+    Stays batched regardless of how many items are in source_items: besides the two
+    existing batched write statements (unchanged), this adds at most two extra
+    set-based (not per-item) SELECTs, used only to log real transitions with their
+    row id and to fill start_quantity/recovery_quantity.
+    """
+    variant_items: Dict[Tuple[int, int], SourceInventoryItem] = {}
     for item in source_items:
+        if not item.inventory_quantity_known:
+            continue
         variant_key = _variant_sales_key(item.product_id, item.variant_id)
         if variant_key is None:
             continue
-        product_id, variant_id = variant_key
+        variant_items[variant_key] = item
 
+    if not variant_items:
+        return
+
+    product_ids = sorted({product_id for product_id, _variant_id in variant_items})
+    placeholders = ", ".join(["%s"] * len(product_ids))
+    cursor.execute(
+        f"""
+        SELECT id, product_id, variant_id, out_of_stock_at
+        FROM inventory_oos_history
+        WHERE back_in_stock_at IS NULL AND product_id IN ({placeholders})
+        """,
+        product_ids,
+    )
+    open_periods: Dict[Tuple[int, int], Any] = {
+        (int(row["product_id"]), int(row["variant_id"])): row for row in cursor.fetchall()
+    }
+
+    restock_params: List[Tuple[datetime, int, int, int]] = []
+    oos_params: List[Tuple[int, int, datetime, int, int, int]] = []
+    went_oos: List[Tuple[Tuple[int, int], SourceInventoryItem]] = []
+    back_in_stock: List[Tuple[Tuple[int, int], SourceInventoryItem, Any]] = []
+
+    for variant_key, item in variant_items.items():
+        product_id, variant_id = variant_key
+        currently_open = open_periods.get(variant_key)
         if item.inventory_quantity > 0:
-            restock_params.append((detected_at, product_id, variant_id))
+            restock_params.append(
+                (detected_at, item.inventory_quantity, product_id, variant_id)
+            )
+            if currently_open is not None:
+                back_in_stock.append((variant_key, item, currently_open))
         else:
-            oos_params.append((product_id, variant_id, detected_at, product_id, variant_id))
+            oos_params.append(
+                (product_id, variant_id, detected_at, item.inventory_quantity, product_id, variant_id)
+            )
+            if currently_open is None:
+                went_oos.append((variant_key, item))
 
     if restock_params:
         cursor.executemany(
             """
             UPDATE inventory_oos_history
-            SET back_in_stock_at = %s
+            SET back_in_stock_at = %s, recovery_quantity = %s
             WHERE product_id = %s AND variant_id = %s AND back_in_stock_at IS NULL
             """,
             restock_params,
@@ -1464,14 +1528,68 @@ def update_oos_history(
     if oos_params:
         cursor.executemany(
             """
-            INSERT INTO inventory_oos_history (product_id, variant_id, out_of_stock_at)
-            SELECT %s, %s, %s
+            INSERT INTO inventory_oos_history (product_id, variant_id, out_of_stock_at, start_quantity)
+            SELECT %s, %s, %s, %s
             WHERE NOT EXISTS (
                 SELECT 1 FROM inventory_oos_history
                 WHERE product_id = %s AND variant_id = %s AND back_in_stock_at IS NULL
             )
             """,
             oos_params,
+        )
+
+    new_period_ids: Dict[Tuple[int, int], Any] = {}
+    if went_oos:
+        opened_product_ids = sorted({product_id for (product_id, _variant_id), _item in went_oos})
+        placeholders2 = ", ".join(["%s"] * len(opened_product_ids))
+        cursor.execute(
+            f"""
+            SELECT id, product_id, variant_id
+            FROM inventory_oos_history
+            WHERE out_of_stock_at = %s AND product_id IN ({placeholders2})
+            """,
+            [detected_at] + opened_product_ids,
+        )
+        new_period_ids = {
+            (int(row["product_id"]), int(row["variant_id"])): row["id"] for row in cursor.fetchall()
+        }
+
+    for variant_key, item in went_oos:
+        product_id, variant_id = variant_key
+        logger.info(
+            "%s PRODUCT_WENT_OOS product_id=%s variant_id=%s previous_state=in_stock_or_unseen "
+            "current_quantity=%s oos_period_id=%s detected_at=%s",
+            log_prefix(brand),
+            product_id,
+            variant_id,
+            item.inventory_quantity,
+            new_period_ids.get(variant_key),
+            detected_at,
+        )
+
+    for variant_key, item, currently_open in back_in_stock:
+        product_id, variant_id = variant_key
+        out_of_stock_at = currently_open["out_of_stock_at"]
+        if isinstance(out_of_stock_at, str):
+            # Some cursors (e.g. sqlite3 without detect_types) return DATETIME
+            # columns as ISO strings rather than datetime objects.
+            try:
+                out_of_stock_at = datetime.fromisoformat(out_of_stock_at)
+            except ValueError:
+                out_of_stock_at = None
+        duration_minutes = None
+        if isinstance(out_of_stock_at, datetime):
+            duration_minutes = int((detected_at - out_of_stock_at).total_seconds() // 60)
+        logger.info(
+            "%s PRODUCT_BACK_IN_STOCK product_id=%s variant_id=%s previous_quantity=0 "
+            "current_quantity=%s oos_period_id=%s duration_minutes=%s detected_at=%s",
+            log_prefix(brand),
+            product_id,
+            variant_id,
+            item.inventory_quantity,
+            currently_open["id"],
+            duration_minutes,
+            detected_at,
         )
 
 
@@ -1496,7 +1614,7 @@ def calculate_domain_items(
     unique_variant_pairs = sorted(set(variant_pairs))
     with get_db_cursor(brand.brand_id) as (_, cursor, connection):
         sold_units_by_variant = bulk_fetch_sold_units(cursor, unique_variant_pairs)
-        update_oos_history(cursor, source_items, detected_at)
+        update_oos_history(cursor, source_items, detected_at, brand)
         connection.commit()
 
     calculated_items: List[CalculatedInventoryItem] = []

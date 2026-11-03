@@ -1029,6 +1029,11 @@ class _SqliteOosCursor:
 def _make_oos_cursor():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
+    # start_quantity/recovery_quantity are plain columns here, populated by
+    # update_oos_history's own params - same as production. duration_minutes is a
+    # MySQL STORED GENERATED column with no application code involved (mirrors how
+    # the pre-existing is_open generated column is also not modeled in this
+    # lightweight sqlite harness), so it's intentionally omitted here.
     conn.execute(
         """
         CREATE TABLE inventory_oos_history (
@@ -1036,7 +1041,9 @@ def _make_oos_cursor():
             product_id INTEGER NOT NULL,
             variant_id INTEGER NOT NULL,
             out_of_stock_at TEXT NOT NULL,
-            back_in_stock_at TEXT NULL
+            back_in_stock_at TEXT NULL,
+            start_quantity INTEGER NULL,
+            recovery_quantity INTEGER NULL
         )
         """
     )
@@ -1045,7 +1052,8 @@ def _make_oos_cursor():
 
 def _open_periods(conn):
     rows = conn.execute(
-        "SELECT product_id, variant_id, out_of_stock_at, back_in_stock_at "
+        "SELECT product_id, variant_id, out_of_stock_at, back_in_stock_at, "
+        "start_quantity, recovery_quantity "
         "FROM inventory_oos_history WHERE back_in_stock_at IS NULL"
     ).fetchall()
     return [dict(row) for row in rows]
@@ -1053,7 +1061,8 @@ def _open_periods(conn):
 
 def _all_periods(conn):
     rows = conn.execute(
-        "SELECT product_id, variant_id, out_of_stock_at, back_in_stock_at "
+        "SELECT product_id, variant_id, out_of_stock_at, back_in_stock_at, "
+        "start_quantity, recovery_quantity "
         "FROM inventory_oos_history ORDER BY id"
     ).fetchall()
     return [dict(row) for row in rows]
@@ -1188,6 +1197,92 @@ class OosHistoryTests(unittest.TestCase):
         conn.commit()
 
         self.assertEqual(_all_periods(conn), [])
+
+    def test_missing_quantity_is_skipped_not_treated_as_oos(self):
+        # inventory_quantity_known=False simulates a partial/failed sync payload
+        # that had no inventory_quantity field at all - must not be treated as a 0.
+        conn, cursor = _make_oos_cursor()
+        item = pipeline.SourceInventoryItem(
+            "test.myshopify.com", 1, "P", 1, "A", "SKU", 0,
+            inventory_quantity_known=False,
+        )
+        pipeline.update_oos_history(cursor, [item], datetime(2026, 1, 1, 11, 0))
+        conn.commit()
+
+        self.assertEqual(_all_periods(conn), [])
+
+    def test_missing_quantity_does_not_close_an_open_period(self):
+        conn, cursor = _make_oos_cursor()
+        oos_item = pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1, "A", "SKU", 0)
+        unknown_item = pipeline.SourceInventoryItem(
+            "test.myshopify.com", 1, "P", 1, "A", "SKU", 0,
+            inventory_quantity_known=False,
+        )
+        pipeline.update_oos_history(cursor, [oos_item], datetime(2026, 1, 1, 11, 0))
+        pipeline.update_oos_history(cursor, [unknown_item], datetime(2026, 1, 1, 11, 30))
+        conn.commit()
+
+        open_rows = _open_periods(conn)
+        self.assertEqual(len(open_rows), 1)
+
+    def test_start_and_recovery_quantity_recorded(self):
+        conn, cursor = _make_oos_cursor()
+        oos_item = pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1, "A", "SKU", 0)
+        restock_item = pipeline.SourceInventoryItem(
+            "test.myshopify.com", 1, "P", 1, "A", "SKU", 42
+        )
+        pipeline.update_oos_history(cursor, [oos_item], datetime(2026, 1, 1, 11, 0))
+        pipeline.update_oos_history(cursor, [restock_item], datetime(2026, 1, 1, 13, 0))
+        conn.commit()
+
+        periods = _all_periods(conn)
+        self.assertEqual(len(periods), 1)
+        self.assertEqual(periods[0]["start_quantity"], 0)
+        self.assertEqual(periods[0]["recovery_quantity"], 42)
+
+    def test_went_oos_log_emitted_once_with_period_id(self):
+        conn, cursor = _make_oos_cursor()
+        item = pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1, "A", "SKU", 0)
+        with self.assertLogs(pipeline.logger, level="INFO") as log_ctx:
+            pipeline.update_oos_history(cursor, [item], datetime(2026, 1, 1, 11, 0))
+        conn.commit()
+
+        went_oos_lines = [m for m in log_ctx.output if "PRODUCT_WENT_OOS" in m]
+        self.assertEqual(len(went_oos_lines), 1)
+        self.assertIn("product_id=1", went_oos_lines[0])
+        self.assertIn("variant_id=1", went_oos_lines[0])
+        self.assertNotIn("oos_period_id=None", went_oos_lines[0])
+
+        # A second cycle that stays OOS must not log a second PRODUCT_WENT_OOS.
+        with self.assertNoLogs(pipeline.logger, level="INFO"):
+            pipeline.update_oos_history(cursor, [item], datetime(2026, 1, 1, 11, 30))
+        conn.commit()
+
+    def test_back_in_stock_log_includes_duration(self):
+        conn, cursor = _make_oos_cursor()
+        oos_item = pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1, "A", "SKU", 0)
+        restock_item = pipeline.SourceInventoryItem(
+            "test.myshopify.com", 1, "P", 1, "A", "SKU", 20
+        )
+        pipeline.update_oos_history(cursor, [oos_item], datetime(2026, 1, 1, 11, 0))
+
+        with self.assertLogs(pipeline.logger, level="INFO") as log_ctx:
+            pipeline.update_oos_history(cursor, [restock_item], datetime(2026, 1, 1, 13, 0))
+        conn.commit()
+
+        back_lines = [m for m in log_ctx.output if "PRODUCT_BACK_IN_STOCK" in m]
+        self.assertEqual(len(back_lines), 1)
+        self.assertIn("duration_minutes=120", back_lines[0])
+
+    def test_no_op_transitions_log_nothing(self):
+        conn, cursor = _make_oos_cursor()
+        item = pipeline.SourceInventoryItem("test.myshopify.com", 1, "P", 1, "A", "SKU", 5)
+        pipeline.update_oos_history(cursor, [item], datetime(2026, 1, 1, 10, 0))
+        conn.commit()
+
+        with self.assertNoLogs(pipeline.logger, level="INFO"):
+            pipeline.update_oos_history(cursor, [item], datetime(2026, 1, 1, 10, 30))
+        conn.commit()
 
     def test_calculate_domain_items_invokes_oos_history_update_and_commits(self):
         brand = _make_brand()
